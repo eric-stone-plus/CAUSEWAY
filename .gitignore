@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Runtime artifacts: state, logs, and temporary data-plane configs never enter the repo
+state.json
+*.log
+*.jsonl
+/run/

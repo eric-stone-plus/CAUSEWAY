@@ -1,0 +1,79 @@
+# CAUSEWAY example configuration — copy to ~/.config/causeway/config.toml and
+# adjust to your deployment.
+# Convention: endpoint data comes only from local manifest files read at
+# runtime; never hardcode endpoints or credentials in the repo.
+
+# Log directory (JSON Lines, rotated daily; stdout always carries an
+# additional compact log for journald to collect)
+log_dir = "~/.local/share/causeway/logs"
+# Persistent state for endpoint scoring / current routes
+state_file = "~/.local/share/causeway/state.json"
+# Data-plane adapter binary (default install location of
+# scripts/install-dataplane.sh)
+sslocal_bin = "~/.local/share/causeway/bin/sslocal"
+# Transport plugin binary: required by endpoints that declare a plugin
+# (default install location of scripts/install-plugin.sh; endpoints needing a
+# missing plugin fail activation with a clear error)
+obfs_plugin_bin = "~/.local/share/causeway/bin/obfs-local"
+# Second data-plane adapter binary: required by manifest entry types that the
+# primary adapter does not serve (entries whose adapter is missing fail
+# activation with a clear error)
+singbox_bin = "~/.local/share/causeway/bin/sing-box"
+
+# Named subscriptions are mutually exclusive: exactly one profile supplies
+# the live node pool. `default` is used on first run; a successful runtime
+# selection may be persisted separately.
+[subscriptions]
+default = "local-primary"
+
+# A local profile may merge several YAML manifest snapshots. Unsupported entry
+# types are rejected explicitly at parse time.
+[subscriptions.profiles.local-primary]
+files = [
+  "~/.local/share/causeway/subscriptions/example.yaml",
+]
+
+# A remote profile keeps its credential-bearing HTTPS URL out of this config.
+# Put the single URL in `url_file` and chmod that file 600. The downloaded
+# manifest is validated before atomically replacing the private cache.
+[subscriptions.profiles.remote-backup]
+url_file = "~/.config/causeway/subscriptions/remote-backup.url"
+cache_file = "~/.local/share/causeway/subscriptions/remote-backup.yaml"
+
+# Backward compatibility: an existing configuration may keep the original
+# single-profile shape below instead of `default`/`profiles`:
+# [subscriptions]
+# files = ["~/.local/share/causeway/subscriptions/example.yaml"]
+
+# Traffic classes → loopback listen addresses. Clients pick a listener by
+# purpose; CAUSEWAY does no rule-based splitting. The ports below are
+# placeholders — choose your own.
+[classes.dev]
+listen = "127.0.0.1:17878"      # development traffic
+
+[classes.market]
+listen = "127.0.0.1:17879"      # market-data traffic
+
+[probe]
+interval_secs = 600            # periodic re-probe interval (default 10 minutes)
+timeout_ms = 3000              # per-probe TCP connect timeout
+concurrency = 32               # bounded concurrency, no hammering
+
+[health]
+interval_secs = 30             # full-path health check interval for the active route
+timeout_ms = 5000              # per-check timeout
+fail_threshold = 3             # N consecutive failures trigger a switch
+url = "http://www.gstatic.com/generate_204"   # must be plaintext http://
+drain_grace_secs = 10          # minimum old-path grace; active pipes may extend it within a hard cap
+
+[selection]
+hysteresis = 0.30              # a challenger must win by a 30% clear margin
+ema_alpha = 0.3                # EMA smoothing factor
+regions = []                   # node display-name substrings eligible for AUTOMATIC
+                               # selection only (initial activation, health-failure
+                               # recovery, challenger-wins); empty = all nodes.
+                               # Manual switching is never restricted. e.g. ["🇭🇰"]
+auto_switch = true             # false = a working active node never moves on its own:
+                               # health-failure recovery and challenger-wins only log.
+                               # Establishing a path when no node is active stays
+                               # automatic (availability, not switching).

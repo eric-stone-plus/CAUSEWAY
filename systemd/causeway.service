@@ -1,0 +1,86 @@
+# CAUSEWAY — systemd user unit
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/causeway.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now causeway
+#   loginctl enable-linger "$USER"   # if it must run while logged out
+[Unit]
+Description=CAUSEWAY — local egress gateway (userspace TCP only, no TUN)
+After=network-online.target
+Wants=network-online.target
+# Crash-storm backstop: give up after more than 5 restarts within 10 minutes
+# (human intervention instead of endless flapping)
+# Note: StartLimit* belongs to the [Unit] section (in [Service] it is ignored
+# by newer systemd)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Adjust the binary path in ExecStart to the actual install location
+ExecStart=%h/.cargo/bin/causeway run --config %h/.config/causeway/config.toml
+Restart=always
+RestartSec=3
+# CAUSEWAY owns its adapter children. Stop the complete service cgroup so an
+# abrupt daemon failure or stop-timeout cannot leave a credential-bearing
+# adapter behind. The daemon itself performs bounded, handle-owned child
+# cleanup first; systemd is the final containment backstop.
+KillMode=control-group
+SendSIGKILL=yes
+# Subscription preparation has an internal 150s fuse. Leave 30s for listener
+# drain, adapter cleanup, and state flush before systemd enforces the bound.
+TimeoutStopSec=180s
+
+# ---- Sandbox hardening (options available to user units) ----
+# CAUSEWAY only listens on loopback high ports and only makes outbound TCP
+# connections; it needs no capabilities and never creates a TUN device or
+# touches routes (that is a code-level red line — this is just a second gate).
+NoNewPrivileges=true
+# Empty capability sets deny route, interface, firewall, raw-socket, and
+# device administration even if a child binary later tries to request them.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Keep the socket surface to the local control socket, ordinary IP networking,
+# and read-only route/interface discovery used internally by sing-box. Netlink
+# mutation remains blocked by the empty capability set; AF_PACKET/raw packet
+# sockets remain unavailable.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Neither CAUSEWAY nor its supervised adapters need to create namespaces.
+# A private device view also keeps host network devices (including /dev/net)
+# outside the service while retaining the ordinary pseudo-devices programs
+# expect.
+RestrictNamespaces=true
+PrivateDevices=true
+# Deny syscall families used to mount filesystems, load modules, manipulate
+# clocks/resources, reboot, perform raw I/O, or use privileged kernel APIs.
+# Ordinary TCP/Unix sockets, child supervision, and private file updates stay
+# available through the normal system-service set.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+# `kill(2)` is required by Tokio's owned Child::start_kill operation. The
+# daemon never signals a numeric PID itself and never matches by process name.
+SystemCallFilter=kill
+SystemCallErrorNumber=EPERM
+RestrictRealtime=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Runtime-writable directories: state, logs, data-plane temp configs (adjust
+# in sync if you customized the paths)
+ReadWritePaths=%h/.local/share/causeway
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+# Outbound networking cannot be disabled (it must reach the node servers);
+# inbound binds loopback only, enforced at the config layer
+
+[Install]
+WantedBy=default.target
