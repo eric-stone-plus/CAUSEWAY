@@ -36,6 +36,11 @@ files = [
 # A remote profile keeps its credential-bearing HTTPS URL out of this config.
 # Put the single URL in `url_file` and chmod that file 600. The downloaded
 # manifest is validated before atomically replacing the private cache.
+# Startup is offline by design: a remote profile used as `default` on a fresh
+# host needs its `cache_file` primed once with a supported manifest (or start
+# with a local snapshot profile and switch) — the daemon cannot bootstrap a
+# remote-only pool from an empty cache because first fetch requires the
+# running daemon's control socket.
 [subscriptions.profiles.remote-backup]
 url_file = "~/.config/causeway/subscriptions/remote-backup.url"
 cache_file = "~/.local/share/causeway/subscriptions/remote-backup.yaml"

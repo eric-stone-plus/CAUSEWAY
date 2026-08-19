@@ -396,14 +396,22 @@ fn ranked_candidates<'a>(nodes: &'a [Node], state: &StateFile, regions: &[String
 
 /// Rank known nodes by score, then append unprobed nodes in a deterministic
 /// order. Subscription transactions need the second half: a new profile must
-/// remain switchable before it has accumulated probe history.
+/// remain switchable before it has accumulated probe history. Like
+/// [`ranked_candidates`], automatic selection (initial activation and
+/// subscription transactions) stays inside the region allowlist.
 fn profile_candidates(
     nodes: &[Node],
     stats: Option<&BTreeMap<String, crate::score::NodeStats>>,
     preferred: Option<&str>,
+    regions: &[String],
 ) -> Vec<Node> {
-    let mut probed: Vec<&Node> = nodes
+    let pool: Vec<&Node> = nodes
         .iter()
+        .filter(|n| regions.is_empty() || regions.iter().any(|r| n.name().contains(r.as_str())))
+        .collect();
+    let mut probed: Vec<&Node> = pool
+        .iter()
+        .copied()
         .filter(|node| {
             stats
                 .and_then(|all| all.get(node.name()))
@@ -414,10 +422,10 @@ fn profile_candidates(
         probed.sort_by(|a, b| score_cmp(&stats[b.name()], &stats[a.name()]));
     }
 
-    let mut ordered = Vec::with_capacity(nodes.len());
+    let mut ordered = Vec::with_capacity(pool.len());
     if let Some(preferred) = preferred {
-        if let Some(node) = nodes.iter().find(|node| node.name() == preferred) {
-            ordered.push(node.clone());
+        if let Some(node) = pool.iter().find(|node| node.name() == preferred) {
+            ordered.push((*node).clone());
         }
     }
     for node in probed {
@@ -425,8 +433,9 @@ fn profile_candidates(
             ordered.push(node.clone());
         }
     }
-    let mut unprobed: Vec<&Node> = nodes
+    let mut unprobed: Vec<&Node> = pool
         .iter()
+        .copied()
         .filter(|node| {
             !stats
                 .and_then(|all| all.get(node.name()))
@@ -719,10 +728,11 @@ async fn switch_to(
         });
     }
     // Requested node failed pre-check: fall back by score, excluding both the
-    // failed request and the current node
+    // failed request and the current node. Manual switching is never
+    // restricted by the region allowlist, so the fallback pool is unfiltered.
     let candidates: Vec<Node> = {
         let st = lock_state(&ctx.state);
-        ranked_candidates(&pool, &st, &ctx.cfg.selection.regions)
+        ranked_candidates(&pool, &st, &[])
             .into_iter()
             .filter(|n| n.name() != requested && Some(n.name()) != current.as_deref())
             .take(MAX_SWITCH_CANDIDATES)
@@ -974,7 +984,12 @@ async fn switch_subscription_locked(
                     .map(|active| active.node.name().to_string())
             })
             .flatten();
-        let candidates = profile_candidates(prepared.nodes(), stats.as_ref(), preferred.as_deref());
+        let candidates = profile_candidates(
+            prepared.nodes(),
+            stats.as_ref(),
+            preferred.as_deref(),
+            &ctx.cfg.selection.regions,
+        );
         let mut activated = None;
         for candidate in candidates.into_iter().take(MAX_SWITCH_CANDIDATES) {
             match tokio::time::timeout_at(deadline, try_activate(ctx, &candidate)).await {
@@ -1339,6 +1354,11 @@ const PROBE_NOW_CONCURRENCY: usize = 8;
 async fn probe_now_inner(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
     let nodes = pool(ctx);
     let total = nodes.len();
+    let era = ctx
+        .subscriptions
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .generation;
     let sem = Arc::new(Semaphore::new(PROBE_NOW_CONCURRENCY.min(total.max(1))));
     let mut set = JoinSet::new();
     for node in nodes {
@@ -1346,7 +1366,7 @@ async fn probe_now_inner(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
         let sem = Arc::clone(&sem);
         set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
-            test_node(&ctx, &node).await
+            probe_now_node(&ctx, node, era).await
         });
     }
     let mut out = Vec::with_capacity(total);
@@ -1360,10 +1380,36 @@ async fn probe_now_inner(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
 }
 
 async fn probe_now(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
-    let _reconfiguration = ctx.reconfiguration.read().await;
     let results = probe_now_inner(ctx).await;
     save_state(ctx);
     results
+}
+
+/// One on-demand probe task body. The reconfiguration read gate is scoped to
+/// a single node test, not the whole run: holding it across every remaining
+/// test lets a queued subscription transaction blow its precommit timeout on
+/// a large pool, and the write-preferring lock then also stalls health
+/// checks behind it. The pool era is revalidated under the gate so results
+/// from a snapshot taken before a publication can never land in the new
+/// profile's statistics — the same boundary the whole-run gate used to draw.
+async fn probe_now_node(ctx: &Arc<Ctx>, node: Node, era: u64) -> control::ProbeResult {
+    let _reconfiguration = ctx.reconfiguration.read().await;
+    let still_current = ctx
+        .subscriptions
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .generation
+        == era;
+    if !still_current {
+        return control::ProbeResult {
+            node: node.name().to_string(),
+            ok: false,
+            rtt_ms: None,
+            http_status: None,
+            error: Some("skipped: subscription changed".to_string()),
+        };
+    }
+    test_node(ctx, &node).await
 }
 
 /// One node's end-to-end test: start → readiness → generate_204 → stop.
@@ -1526,7 +1572,12 @@ async fn activate_initial(ctx: &Arc<Ctx>, class: &Arc<tokio::sync::Mutex<ClassRu
     let candidates = {
         let pool = pool(ctx);
         let st = lock_state(&ctx.state);
-        profile_candidates(&pool, Some(&st.nodes), preferred.as_deref())
+        profile_candidates(
+            &pool,
+            Some(&st.nodes),
+            preferred.as_deref(),
+            &ctx.cfg.selection.regions,
+        )
     };
 
     for cand in candidates {
@@ -1830,6 +1881,37 @@ async fn egress_observer_loop(
     }
 }
 
+/// Offline snapshot for daemon startup. Returns the nodes plus whether the
+/// legacy bare cache was skipped because the profile carries a pending
+/// same-name source change: the transaction path refuses to serve an
+/// untrusted cache, and startup must not bypass that quarantine through the
+/// `confirmed_slot = None` compatibility fallback.
+fn startup_snapshot(
+    st: &StateFile,
+    startup_identities: &std::collections::BTreeMap<String, String>,
+    active_profile: &str,
+    profile: &crate::config::SubscriptionProfileConfig,
+) -> (Vec<Node>, bool) {
+    let confirmed_slot = st
+        .subscription_cache_slots
+        .get(active_profile)
+        .map(String::as_str);
+    let source_trusted = startup_identities
+        .get(active_profile)
+        .is_some_and(|identity| st.source_is_trusted(active_profile, identity));
+    match confirmed_slot {
+        Some(slot) => (
+            subscription::load_profile_snapshot_from_slot(profile, Some(slot)),
+            false,
+        ),
+        None if source_trusted => (
+            subscription::load_profile_snapshot_from_slot(profile, None),
+            false,
+        ),
+        None => (Vec::new(), true),
+    }
+}
+
 pub async fn run(cfg: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let _daemon_lock = DaemonLock::acquire(&cfg.state_file)?;
     let ctl_path = control::socket_path(&cfg);
@@ -1862,12 +1944,24 @@ pub async fn run(cfg: Config, config_path: PathBuf) -> anyhow::Result<()> {
     // Startup is deliberately offline: a remote source must use only its
     // last atomically committed cache so daemon availability never depends on
     // provider reachability.
-    let confirmed_slot = st
-        .subscription_cache_slots
-        .get(&active_profile)
-        .map(String::as_str);
-    let nodes = subscription::load_profile_snapshot_from_slot(&profile, confirmed_slot);
+    let (nodes, legacy_quarantined) =
+        startup_snapshot(&st, &startup_identities, &active_profile, &profile);
     if nodes.is_empty() {
+        if legacy_quarantined {
+            bail!(
+                "subscription profile {active_profile:?} has a pending source change and its \
+                 previous-source cache is quarantined; start with a different default profile \
+                 and complete the change via `causeway switch`, or delete the state file to \
+                 reset source trust"
+            );
+        }
+        if profile.files.is_empty() {
+            bail!(
+                "remote subscription profile {active_profile:?} has no local snapshot; startup \
+                 never fetches — prime its cache file once with a supported manifest, or start \
+                 with a local snapshot profile and switch"
+            );
+        }
         bail!("selected subscription has no supported nodes in its local snapshot");
     }
     info!(profile = %active_profile, total = nodes.len(), "node pool loaded");
@@ -1914,17 +2008,6 @@ pub async fn run(cfg: Config, config_path: PathBuf) -> anyhow::Result<()> {
         drain_shutdown,
     });
 
-    // First run (zero probe data) → run one full probe round before startup
-    // to avoid a blind pick
-    if lock_state(&ctx.state)
-        .nodes
-        .values()
-        .all(|n| !n.is_probed())
-    {
-        info!("state has no probe data, running a startup probe round (takes tens of seconds)…");
-        probe_cycle(&ctx, "startup").await;
-    }
-
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Bring up listeners first (stable endpoints matter most), then activate
@@ -1954,6 +2037,19 @@ pub async fn run(cfg: Config, config_path: PathBuf) -> anyhow::Result<()> {
         )));
         classes_by_name.insert(name.clone(), Arc::clone(&rt));
         classes.push(rt);
+    }
+
+    // First run (zero probe data) → run one full probe round before initial
+    // activation to avoid a blind pick. It runs after the listeners are up so
+    // a cold start answers 502s at the stable endpoints during the round
+    // instead of refusing connections outright.
+    if lock_state(&ctx.state)
+        .nodes
+        .values()
+        .all(|n| !n.is_probed())
+    {
+        info!("state has no probe data, running a startup probe round (takes tens of seconds)…");
+        probe_cycle(&ctx, "startup").await;
     }
 
     // Initial activation (serial per class, KISS)
@@ -3220,6 +3316,82 @@ listen = "127.0.0.1:17878"
     }
 
     #[cfg(unix)]
+    #[test]
+    fn startup_snapshot_quarantines_legacy_cache_after_source_change() {
+        let dir = test_dir("startup-legacy-quarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_file = dir.join("cache.yaml");
+        write_private(&cache_file, &one_node_manifest("legacy-node"), 0o600);
+        let profile = SubscriptionProfileConfig {
+            files: Vec::new(),
+            url_file: Some(dir.join("url")),
+            cache_file: Some(cache_file.clone()),
+        };
+
+        // Upgrade story: a legacy daemon left a bare cache, the new daemon
+        // never wrote a slot, and the persisted identity still matches — the
+        // compatibility fallback must keep working.
+        let mut st = StateFile::default();
+        let identities =
+            BTreeMap::from([("remote".to_string(), profile.source_identity().unwrap())]);
+        st.reconcile_startup_sources(&identities);
+        let (nodes, quarantined) = startup_snapshot(&st, &identities, "remote", &profile);
+        assert_eq!(nodes.len(), 1, "trusted source keeps the legacy fallback");
+        assert!(!quarantined);
+
+        // Same-name source change: reconcile_startup_sources quarantines the
+        // profile; startup must not serve the previous source's bare cache
+        // through the None-slot fallback.
+        let new_profile = SubscriptionProfileConfig {
+            files: Vec::new(),
+            url_file: Some(dir.join("moved.url")),
+            cache_file: Some(cache_file),
+        };
+        let changed =
+            BTreeMap::from([("remote".to_string(), new_profile.source_identity().unwrap())]);
+        st.reconcile_startup_sources(&changed);
+        let (nodes, quarantined) = startup_snapshot(&st, &changed, "remote", &new_profile);
+        assert!(nodes.is_empty(), "quarantined cache must not be served");
+        assert!(quarantined);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn on_demand_probe_skips_nodes_from_a_replaced_pool() {
+        let (ctx, _class, _trace, dir) =
+            recovery_fixture(vec![node("current")], [("current", 204)], 1, 0, "probe-era");
+        // Live era: the per-node test runs end to end and records statistics.
+        let era = ctx
+            .subscriptions
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .generation;
+        let result = probe_now_node(&ctx, node("current"), era).await;
+        assert!(result.ok);
+        assert!(lock_state(&ctx.state).nodes["current"].probe_count >= 1);
+
+        // Publication bumped the pool generation: a probe task still holding
+        // an old pool snapshot must skip instead of writing old-pool
+        // statistics into the new profile.
+        ctx.subscriptions
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .generation += 1;
+        let before = lock_state(&ctx.state).nodes["current"].clone();
+        let result = probe_now_node(&ctx, node("current"), era).await;
+        assert!(!result.ok);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("skipped: subscription changed")
+        );
+        let after = lock_state(&ctx.state).nodes["current"].clone();
+        assert_stats_unchanged(&after, &before, "skipped probe must not record stats");
+        stop_draining(&ctx).await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn cache_commit_keeps_owned_guards_after_subscription_task_abort() {
         let target = "commit-barrier";
@@ -3427,7 +3599,7 @@ listen = "127.0.0.1:17878"
             ("slow".to_string(), stats(0.80, Some(500.0))),
         ]);
 
-        let ordered = profile_candidates(&nodes, Some(&stats), Some("preferred"));
+        let ordered = profile_candidates(&nodes, Some(&stats), Some("preferred"), &[]);
         let names: Vec<_> = ordered.iter().map(Node::name).collect();
         assert_eq!(
             names,
@@ -3497,6 +3669,70 @@ listen = "127.0.0.1:17878"
             assert!(non_subscription_config_changed(&running, &candidate));
         }
     }
+    #[test]
+    fn profile_candidates_region_filter_covers_preferred_probed_and_unknown() {
+        let nodes = vec![
+            node("🇭🇰 Hong Kong丨01"),
+            node("🇯🇵 Japan丨01"),
+            node("🇯🇵 Japan丨02"),
+        ];
+        let stats = BTreeMap::from([
+            ("🇭🇰 Hong Kong丨01".to_string(), stats(0.5, Some(500.0))),
+            ("🇯🇵 Japan丨01".to_string(), stats(0.99, Some(50.0))),
+            // Japan丨02 stays unprobed.
+        ]);
+
+        // The preferred incumbent, the higher-scoring probed node, and the
+        // unprobed tail must all stay inside the allowlist.
+        let ordered = profile_candidates(
+            &nodes,
+            Some(&stats),
+            Some("🇯🇵 Japan丨01"),
+            &["🇭🇰".to_string()],
+        );
+        let names: Vec<_> = ordered.iter().map(Node::name).collect();
+        assert_eq!(names, ["🇭🇰 Hong Kong丨01"]);
+
+        let unfiltered = profile_candidates(&nodes, Some(&stats), Some("🇯🇵 Japan丨01"), &[]);
+        assert_eq!(unfiltered.len(), 3, "empty allowlist keeps the whole pool");
+    }
+
+    #[tokio::test]
+    async fn initial_activation_respects_region_allowlist() {
+        // state.json records the incumbent (fixture node "current", standing
+        // in for a Japan node) as the preferred node, but the region
+        // allowlist only admits Hong Kong: initial activation must skip the
+        // out-of-allowlist incumbent instead of reinstalling it.
+        let (ctx, class, trace, dir) = recovery_fixture(
+            vec![node("current"), node("🇭🇰 Hong Kong丨01")],
+            [("🇭🇰 Hong Kong丨01", 204)],
+            1,
+            0,
+            "initial-regions",
+        );
+        let mut ctx = ctx;
+        Arc::get_mut(&mut ctx).unwrap().cfg.selection.regions = vec!["🇭🇰".to_string()];
+        {
+            let mut rt = class.lock().await;
+            rt.active = None;
+        }
+        activate_initial(&ctx, &class).await;
+        assert_eq!(
+            trace.starts(),
+            vec!["🇭🇰 Hong Kong丨01".to_string()],
+            "initial activation must not try the out-of-allowlist incumbent"
+        );
+        let installed = class
+            .lock()
+            .await
+            .active
+            .as_ref()
+            .map(|a| a.node.name().to_string());
+        assert_eq!(installed.as_deref(), Some("🇭🇰 Hong Kong丨01"));
+        stop_draining(&ctx).await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn ranked_candidates_region_filter_restricts_automatic_pool() {
         let dir = test_dir("regions");

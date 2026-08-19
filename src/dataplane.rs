@@ -984,13 +984,13 @@ impl DataPlane for SslocalPlane {
         };
         if !self.bin.exists() {
             bail!(
-                "sslocal does not exist: {} (run scripts/install-sslocal.sh first)",
+                "sslocal does not exist: {} (run scripts/install-dataplane.sh first)",
                 self.bin.display()
             );
         }
         if node.plugin.is_some() && !self.obfs_plugin_bin.exists() {
             bail!(
-                "node {} requires the simple-obfs plugin, but the binary does not exist: {} (run scripts/install-obfs.sh first)",
+                "node {} requires the simple-obfs plugin, but the binary does not exist: {} (run scripts/install-plugin.sh first)",
                 node.name,
                 self.obfs_plugin_bin.display()
             );
