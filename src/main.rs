@@ -277,7 +277,9 @@ fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
-        let mut t: String = s.chars().take(max_chars - 1).collect();
+        // saturating_sub: the TUI passes a dynamically computed width that
+        // reaches 0 in terminals squeezed to two columns.
+        let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         t.push('…');
         t
     }
@@ -429,4 +431,21 @@ fn cmd_config_check(path: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_handles_zero_and_oversized_limits() {
+        // width 0 comes from events_area.width.saturating_sub(2) in a
+        // two-column terminal; it must not underflow.
+        assert_eq!(truncate("event", 0), "…");
+        assert_eq!(truncate("event", 1), "…");
+        assert_eq!(truncate("event", 2), "e…");
+        assert_eq!(truncate("event", 5), "event");
+        assert_eq!(truncate("event", 9), "event");
+        assert_eq!(truncate("", 0), "");
+    }
 }

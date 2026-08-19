@@ -307,13 +307,13 @@ impl Config {
         self.validate_filesystem_roles(config_path)?;
         if !self.sslocal_bin.exists() {
             warnings.push(format!(
-                "sslocal does not exist: {} (run scripts/install-sslocal.sh first)",
+                "sslocal does not exist: {} (run scripts/install-dataplane.sh first)",
                 self.sslocal_bin.display()
             ));
         }
         if !self.obfs_plugin_bin.exists() {
             warnings.push(format!(
-                "obfs plugin does not exist: {} (nodes with plugin: obfs in the subscription will fail to activate; run scripts/install-obfs.sh first)",
+                "obfs plugin does not exist: {} (nodes with plugin: obfs in the subscription will fail to activate; run scripts/install-plugin.sh first)",
                 self.obfs_plugin_bin.display()
             ));
         }

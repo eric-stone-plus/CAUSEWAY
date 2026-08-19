@@ -89,6 +89,12 @@ all nodes, and Tab to cycle classes (plain table when piped) — see `--help`
 for details. Logs:
 `journalctl --user -u causeway -f`.
 
+A deployment whose default profile is remote-only needs one bootstrap step:
+the daemon never fetches at startup, and a first fetch requires the running
+daemon's control socket. Prime the profile's `cache_file` once with a
+supported manifest (fetch it out of band), or start with a local snapshot
+profile and switch.
+
 ## Project layout
 
 ```
