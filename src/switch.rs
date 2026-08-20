@@ -603,6 +603,62 @@ fn classify_switch_reply(
 
 /// Entry point. Stdout not a terminal → plain report (scripts/pipelines);
 /// otherwise the interactive TUI.
+/// Non-interactive automation client: one plain switch (`--node`), or the
+/// probe-first site switch (`--for-site`). Prints one result line and exits;
+/// exit code is nonzero when the daemon reports an error.
+pub async fn run_noninteractive(
+    cfg: &Config,
+    class: &str,
+    node: Option<String>,
+    for_site: Option<String>,
+) -> anyhow::Result<()> {
+    let client = Client::new(control::socket_path(cfg));
+    let request = match (&node, &for_site) {
+        (Some(node), None) => control::Request::Switch {
+            class: class.to_string(),
+            node: node.clone(),
+        },
+        (None, Some(site)) => control::Request::SwitchForSite {
+            class: class.to_string(),
+            site: site.clone(),
+        },
+        _ => anyhow::bail!("exactly one of --node or --for-site is required"),
+    };
+    // A site switch may probe the incumbent plus several candidates; allow
+    // minutes for the pathological case.
+    let reply = client
+        .request(&request, std::time::Duration::from_secs(600))
+        .await?;
+    if !reply.ok {
+        anyhow::bail!("{}", reply.error.unwrap_or_else(|| "switch failed".into()));
+    }
+    if let Some(outcome) = reply.site_switch {
+        println!(
+            "site {} -> {} ({} -> {}): {}",
+            outcome.site,
+            outcome.action,
+            outcome.node_before.as_deref().unwrap_or("-"),
+            outcome.node_after.as_deref().unwrap_or("-"),
+            outcome.detail
+        );
+        return Ok(());
+    }
+    if let Some(outcome) = reply.switch {
+        println!(
+            "switched {} -> {}{}",
+            outcome.requested,
+            outcome.installed,
+            if outcome.fallback {
+                " (score fallback after pre-check failure)"
+            } else {
+                ""
+            }
+        );
+        return Ok(());
+    }
+    anyhow::bail!("daemon replied without a switch outcome")
+}
+
 pub async fn run(cfg: &Config, class: &str) -> anyhow::Result<()> {
     let client = Client::new(control::socket_path(cfg));
     if !std::io::stdout().is_terminal() {
@@ -856,7 +912,9 @@ fn picker_key(app: &mut App, key: KeyCode) -> PickerAction {
                 (Some(name), false) => {
                     app.set_message(
                         MessageLevel::Warning,
-                        format!("subscription {name} is a local file profile; edit config.toml instead"),
+                        format!(
+                            "subscription {name} is a local file profile; edit config.toml instead"
+                        ),
                     );
                 }
                 (None, _) => {}
@@ -1020,7 +1078,10 @@ fn write_subscription_url_atomic(path: &std::path::Path, url: &str) -> std::io::
     use std::os::unix::fs::PermissionsExt;
 
     let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "url_file has no file name")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "url_file has no file name",
+        )
     })?;
     let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
     {
@@ -1722,7 +1783,8 @@ fn render_subscription_picker(f: &mut Frame, app: &App, picker: &SubscriptionPic
         )
     } else {
         (
-            "VIEW ONLY \u{2502} k/\u{2191} up \u{2502} j/\u{2193} down \u{2502} Esc close".to_string(),
+            "VIEW ONLY \u{2502} k/\u{2191} up \u{2502} j/\u{2193} down \u{2502} Esc close"
+                .to_string(),
             Color::Yellow,
         )
     };
@@ -2822,18 +2884,17 @@ listen = "127.0.0.1:17878"
             .as_ref()
             .unwrap()
             .len();
-        assert_eq!(buffer_len, "https://subscription.example/secret-marker".len());
+        assert_eq!(
+            buffer_len,
+            "https://subscription.example/secret-marker".len()
+        );
 
         // Backspace works; the rendered frame never echoes the secret.
         picker_key(&mut app, KeyCode::Backspace);
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| {
-                render_subscription_picker(
-                    frame,
-                    &app,
-                    app.subscription_picker.as_ref().unwrap(),
-                );
+                render_subscription_picker(frame, &app, app.subscription_picker.as_ref().unwrap());
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -2859,7 +2920,11 @@ listen = "127.0.0.1:17878"
     #[test]
     fn url_edit_rejects_invalid_urls_without_writing() {
         let (mut app, dir) = app_with_url_edit_target("primary");
-        for attempt in ["http://insecure.example/sub", "https://", "https://has space.example/"] {
+        for attempt in [
+            "http://insecure.example/sub",
+            "https://",
+            "https://has space.example/",
+        ] {
             open_subscription_picker(&mut app);
             picker_key(&mut app, KeyCode::Char('e'));
             for c in attempt.chars() {
@@ -2889,7 +2954,10 @@ listen = "127.0.0.1:17878"
         assert_eq!(picker_key(&mut app, KeyCode::Enter), PickerAction::None);
 
         let url_file = dir.join("secondary.url");
-        assert_eq!(std::fs::read_to_string(&url_file).unwrap(), format!("{url}\n"));
+        assert_eq!(
+            std::fs::read_to_string(&url_file).unwrap(),
+            format!("{url}\n")
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

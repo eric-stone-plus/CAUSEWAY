@@ -38,6 +38,7 @@ use crate::health;
 use crate::listener::{self, ClassRoute, SharedRoute};
 use crate::probe;
 use crate::score::{challenger_wins, score_cmp};
+use crate::siteprobe::{self, SiteStatus, SiteVerdict};
 use crate::state::{self, StateFile};
 use crate::subscription::{self, Node};
 
@@ -372,7 +373,11 @@ async fn stop_draining(ctx: &Ctx) {
 
 /// Return probed nodes from highest to lowest score (stale statistics for
 /// nodes no longer in the current subscription pool are filtered out).
-fn ranked_candidates<'a>(nodes: &'a [Node], state: &StateFile, regions: &[String]) -> Vec<&'a Node> {
+fn ranked_candidates<'a>(
+    nodes: &'a [Node],
+    state: &StateFile,
+    regions: &[String],
+) -> Vec<&'a Node> {
     let mut probed: Vec<&Node> = nodes
         .iter()
         .filter(|n| {
@@ -1343,7 +1348,265 @@ async fn handle_control(
         }
         control::Request::Events => control::Reply::ok_events(ctx.events.snapshot()),
         control::Request::Reload => reload(&ctx, &classes).await,
+        control::Request::SiteProbe { site } => site_probe_request(&ctx, site).await,
+        control::Request::SiteStatus => {
+            let matrix = lock_state(&ctx.state).site_verdicts.clone();
+            control::Reply::ok_site_matrix(matrix)
+        }
+        control::Request::SwitchForSite { class, site } => {
+            switch_for_site(&ctx, &classes, &class, &site).await
+        }
     }
+}
+
+/// Record one verdict into the freeze matrix (state write, no save; callers
+/// batch their saves).
+fn record_site_verdict(ctx: &Ctx, site: &str, node: &str, verdict: SiteVerdict) {
+    let mut st = lock_state(&ctx.state);
+    st.updated_unix = state::now_unix();
+    st.site_verdicts
+        .entry(site.to_string())
+        .or_default()
+        .insert(node.to_string(), verdict);
+}
+
+/// A verdict younger than the configured TTL is authoritative; anything
+/// older is re-probed before it steers a switch.
+fn fresh_verdict(ctx: &Ctx, site: &str, node: &str) -> Option<SiteVerdict> {
+    let st = lock_state(&ctx.state);
+    let verdict = st.site_verdicts.get(site)?.get(node)?.clone();
+    let age = (state::now_unix() - verdict.checked_unix).max(0) as u64;
+    (age <= ctx.cfg.sites.verdict_ttl_secs).then_some(verdict)
+}
+
+/// Probe one (site, node) pair through a temporary data plane and record
+/// the verdict. Takes the reconfiguration read gate for the probe only, the
+/// same boundary `probe_now_node` draws.
+async fn probe_site_node(ctx: &Arc<Ctx>, node: &Node, site: &str, url: &str) -> SiteVerdict {
+    let _reconfiguration = ctx.reconfiguration.read().await;
+    let timeout = std::time::Duration::from_millis(ctx.cfg.sites.timeout_ms);
+    let ua = ctx.cfg.sites.user_agent.clone();
+    let now = state::now_unix();
+    let mut verdict = SiteVerdict {
+        status: SiteStatus::Unknown,
+        http_status: None,
+        checked_unix: now,
+        detail: None,
+    };
+    let spec = match StartSpec::reserve(node.clone()) {
+        Ok(spec) => spec,
+        Err(e) => {
+            verdict.detail = Some(format!("reserve adapter ports: {e:#}"));
+            record_site_verdict(ctx, site, node.name(), verdict.clone());
+            return verdict;
+        }
+    };
+    let mut handle = match ctx.plane.start(spec).await {
+        Ok(h) => h,
+        Err(e) => {
+            verdict.detail = Some(format!("start data plane: {e:#}"));
+            record_site_verdict(ctx, site, node.name(), verdict.clone());
+            return verdict;
+        }
+    };
+    let res = siteprobe::https_get_status_via_proxy(handle.http_addr(), url, &ua, timeout).await;
+    if let Err(e) = handle.stop().await {
+        warn!(node = %node.name(), site, error = %format!("{e:#}"), "failed to stop site-probe data plane");
+    }
+    match res {
+        Ok(code) => {
+            verdict.status = siteprobe::classify_status(code);
+            verdict.http_status = Some(code);
+        }
+        Err(e) => {
+            verdict.detail = Some(format!("{e:#}"));
+        }
+    }
+    record_site_verdict(ctx, site, node.name(), verdict.clone());
+    verdict
+}
+
+/// `SiteProbe` request body: one site (or all configured sites) through
+/// every pool node, bounded like `probe_now`.
+async fn site_probe_request(ctx: &Arc<Ctx>, site: Option<String>) -> control::Reply {
+    let sites: Vec<(String, String)> = match site.as_deref() {
+        Some(name) => match ctx.cfg.sites.list.get(name) {
+            Some(target) => vec![(name.to_string(), target.url.clone())],
+            None => {
+                let known: Vec<&String> = ctx.cfg.sites.list.keys().collect();
+                return control::Reply::err(format!(
+                    "unknown site {name:?}; configured sites: {known:?}"
+                ));
+            }
+        },
+        None => ctx
+            .cfg
+            .sites
+            .list
+            .iter()
+            .map(|(name, target)| (name.clone(), target.url.clone()))
+            .collect(),
+    };
+    if sites.is_empty() {
+        return control::Reply::err("no sites configured under [sites.list]");
+    }
+    let nodes = pool(ctx);
+    let sem = Arc::new(Semaphore::new(PROBE_NOW_CONCURRENCY.max(1)));
+    let mut set: JoinSet<()> = JoinSet::new();
+    for (name, url) in &sites {
+        for node in &nodes {
+            let ctx = Arc::clone(ctx);
+            let sem = Arc::clone(&sem);
+            let site_name = name.clone();
+            let url = url.clone();
+            let node = node.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore is never closed");
+                probe_site_node(&ctx, &node, &site_name, &url).await;
+            });
+        }
+    }
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res {
+            warn!(error = %format!("{e:#}"), "site probe task ended abnormally");
+        }
+    }
+    save_state(ctx);
+    let total_pairs = sites.len() * nodes.len();
+    let ok = sites
+        .iter()
+        .filter(|(name, _)| {
+            lock_state(&ctx.state)
+                .site_verdicts
+                .get(name)
+                .map(|m| m.values().any(|v| v.status == SiteStatus::Ok))
+                .unwrap_or(false)
+        })
+        .count();
+    ctx.events.push(control::Event::Probed {
+        unix: state::now_unix(),
+        source: format!(
+            "site-probe:{}",
+            sites
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        ok,
+        total: total_pairs,
+    });
+    let matrix = lock_state(&ctx.state).site_verdicts.clone();
+    control::Reply::ok_site_matrix(matrix)
+}
+
+/// `SwitchForSite` request body: probe-first, switch only on a confirmed
+/// freeze. Probing happens outside the class lock (it takes seconds); the
+/// switch itself re-locks and re-checks the incumbent, so a concurrent
+/// manual switch is never clobbered blindly.
+async fn switch_for_site(
+    ctx: &Arc<Ctx>,
+    classes: &Arc<HashMap<String, Arc<tokio::sync::Mutex<ClassRuntime>>>>,
+    class: &str,
+    site: &str,
+) -> control::Reply {
+    let Some(target) = ctx.cfg.sites.list.get(site) else {
+        let known: Vec<&String> = ctx.cfg.sites.list.keys().collect();
+        return control::Reply::err(format!(
+            "unknown site {site:?}; configured sites: {known:?}"
+        ));
+    };
+    let url = target.url.clone();
+    let Some(rt) = classes.get(class).cloned() else {
+        return control::Reply::err(format!("unknown class {class:?}"));
+    };
+    let node_before: Option<String> = {
+        let rt = rt.lock().await;
+        rt.active.as_ref().map(|a| a.node.name().to_string())
+    };
+
+    // 1. The incumbent goes first: a fresh Ok verdict means the scrape
+    //    failure was not the exit's fault and nothing should move.
+    if let Some(current) = node_before.as_deref() {
+        let verdict = match fresh_verdict(ctx, site, current) {
+            Some(v) => v,
+            None => {
+                let node = pool(ctx).into_iter().find(|n| n.name() == current);
+                match node {
+                    Some(node) => probe_site_node(ctx, &node, site, &url).await,
+                    // Pool changed under us; treat as unknown and let the
+                    // candidate search run.
+                    None => SiteVerdict {
+                        status: SiteStatus::Unknown,
+                        http_status: None,
+                        checked_unix: state::now_unix(),
+                        detail: Some("incumbent left the pool".into()),
+                    },
+                }
+            }
+        };
+        if verdict.status == SiteStatus::Ok {
+            return control::Reply::ok_site_switch(control::SwitchForSiteOutcome {
+                site: site.to_string(),
+                action: "kept".into(),
+                node_before: node_before.clone(),
+                node_after: node_before,
+                detail: format!("incumbent serves the site (HTTP {:?})", verdict.http_status),
+            });
+        }
+    }
+
+    // 2. Search score-ordered candidates; stop at the first node the site
+    //    actually serves. `regions` is not applied: this is an explicit,
+    //    automation-requested switch, same freedom as the TUI.
+    let current = node_before.clone();
+    let candidates: Vec<Node> = {
+        let pool = pool(ctx);
+        let st = lock_state(&ctx.state);
+        ranked_candidates(&pool, &st, &[])
+            .into_iter()
+            .filter(|n| Some(n.name()) != current.as_deref())
+            .take(ctx.cfg.sites.max_candidates)
+            .cloned()
+            .collect()
+    };
+    for node in &candidates {
+        let verdict = probe_site_node(ctx, node, site, &url).await;
+        if verdict.status != SiteStatus::Ok {
+            continue;
+        }
+        match switch_to(ctx, &rt, node.name()).await {
+            Ok(_) => {
+                save_state(ctx);
+                return control::Reply::ok_site_switch(control::SwitchForSiteOutcome {
+                    site: site.to_string(),
+                    action: "switched".into(),
+                    node_before: node_before.clone(),
+                    node_after: Some(node.name().to_string()),
+                    detail: format!(
+                        "incumbent frozen; switched to a node the site serves (HTTP {:?})",
+                        verdict.http_status
+                    ),
+                });
+            }
+            // Pre-check failure: the node passed the site probe but not the
+            // generic path check; keep searching.
+            Err(e) => {
+                warn!(node = %node.name(), site, error = %format!("{e:#}"), "site-switch candidate failed activation");
+            }
+        }
+    }
+    save_state(ctx);
+    control::Reply::ok_site_switch(control::SwitchForSiteOutcome {
+        site: site.to_string(),
+        action: "no-candidate".into(),
+        node_before: node_before.clone(),
+        node_after: node_before,
+        detail: format!(
+            "no probed candidate served the site among {} tried; staying put",
+            candidates.len()
+        ),
+    })
 }
 
 /// End-to-end test of every node: fresh data plane on free ports, one
@@ -3746,7 +4009,9 @@ listen = "127.0.0.1:17878"
         let mut state = StateFile::default();
         state.activate_subscription(LEGACY_SUBSCRIPTION_NAME);
         for n in &nodes {
-            state.nodes.insert(n.name().to_string(), stats(1.0, Some(100.0)));
+            state
+                .nodes
+                .insert(n.name().to_string(), stats(1.0, Some(100.0)));
         }
         let all = ranked_candidates(&nodes, &state, &[]);
         assert_eq!(all.len(), 3, "no filter keeps the whole pool");

@@ -54,6 +54,8 @@ pub struct Config {
     pub health: HealthConfig,
     #[serde(default)]
     pub selection: SelectionConfig,
+    #[serde(default)]
+    pub sites: SitesConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -122,6 +124,36 @@ pub struct HealthConfig {
     /// subject to the supervisor's bounded retirement fail-safe.
     #[serde(default = "default_drain_grace")]
     pub drain_grace_secs: u64,
+}
+
+/// Anti-bot freeze awareness: named external sites that scraping routes
+/// through, so a node whose exit IP a site has frozen can be detected by a
+/// direct HTTPS probe and avoided for that site.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SitesConfig {
+    /// Per-site HTTPS probe timeout
+    #[serde(default = "default_site_timeout_ms")]
+    pub timeout_ms: u64,
+    /// How many score-ordered candidate nodes to probe for a site before
+    /// giving up on finding a non-frozen exit
+    #[serde(default = "default_site_max_candidates")]
+    pub max_candidates: usize,
+    /// A verdict older than this is stale and is re-probed on demand
+    #[serde(default = "default_site_verdict_ttl_secs")]
+    pub verdict_ttl_secs: u64,
+    /// Browser-ish User-Agent for site probes. Anti-bot verdicts are only
+    /// meaningful when the probe looks like the traffic it stands in for.
+    #[serde(default = "default_site_user_agent")]
+    pub user_agent: String,
+    /// site name (usually the URL host) -> probe target
+    #[serde(default)]
+    pub list: BTreeMap<String, SiteTargetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SiteTargetConfig {
+    /// Absolute https:// URL probed through each node's data plane
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -198,6 +230,18 @@ fn default_regions() -> Vec<String> {
 fn default_auto_switch() -> bool {
     true
 }
+fn default_site_timeout_ms() -> u64 {
+    8000
+}
+fn default_site_max_candidates() -> usize {
+    5
+}
+fn default_site_verdict_ttl_secs() -> u64 {
+    1800
+}
+fn default_site_user_agent() -> String {
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36".to_string()
+}
 
 impl Default for ProbeConfig {
     fn default() -> Self {
@@ -228,6 +272,18 @@ impl Default for SelectionConfig {
             ema_alpha: default_ema_alpha(),
             regions: default_regions(),
             auto_switch: default_auto_switch(),
+        }
+    }
+}
+
+impl Default for SitesConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: default_site_timeout_ms(),
+            max_candidates: default_site_max_candidates(),
+            verdict_ttl_secs: default_site_verdict_ttl_secs(),
+            user_agent: default_site_user_agent(),
+            list: BTreeMap::new(),
         }
     }
 }
@@ -351,6 +407,22 @@ impl Config {
             // The health check deliberately uses plaintext HTTP only
             // (generate_204 semantics); HTTPS would add needless complexity
             bail!("health.url must be an absolute plaintext http:// URL without credentials, fragments, whitespace, or control characters");
+        }
+        for (name, target) in &self.sites.list {
+            if !valid_site_url(&target.url) {
+                bail!(
+                    "sites.list.{name}.url must be an absolute https:// URL without credentials, fragments, whitespace, or control characters"
+                );
+            }
+        }
+        if self.sites.timeout_ms == 0 {
+            bail!("sites.timeout_ms must be > 0");
+        }
+        if self.sites.max_candidates == 0 {
+            bail!("sites.max_candidates must be >= 1");
+        }
+        if self.sites.user_agent.trim().is_empty() {
+            bail!("sites.user_agent must be a non-empty string");
         }
         Ok(warnings)
     }
@@ -858,6 +930,22 @@ fn valid_health_url(url: &str) -> bool {
         return false;
     }
     let authority = url["http://".len()..]
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
+}
+
+/// Site probe targets are the opposite of the health URL: anti-bot verdicts
+/// are only meaningful on the TLS leg, so https:// is required.
+fn valid_site_url(url: &str) -> bool {
+    if !url.starts_with("https://")
+        || url.chars().any(|c| c.is_whitespace() || c.is_control())
+        || url.contains('#')
+    {
+        return false;
+    }
+    let authority = url["https://".len()..]
         .split(['/', '?'])
         .next()
         .unwrap_or_default();

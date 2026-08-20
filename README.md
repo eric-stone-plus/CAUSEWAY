@@ -89,6 +89,27 @@ all nodes, and Tab to cycle classes (plain table when piped) — see `--help`
 for details. Logs:
 `journalctl --user -u causeway -f`.
 
+### Site freeze awareness (anti-bot)
+
+Scraping stacks routinely share one egress until a site freezes that exit
+IP. `[sites.list]` names the sites worth protecting; each entry is probed
+per node with a real HTTPS GET (browser User-Agent, status line only) —
+the same leg anti-bot systems fingerprint.
+
+```bash
+causeway sites                      # freeze matrix: site × node verdicts
+causeway sites --probe www.cnbc.com # refresh one site across the pool
+causeway switch --class crawler --for-site www.cnbc.com --yes
+```
+
+`--for-site` is probe-first automation: the incumbent node is re-probed
+unless a verdict younger than `sites.verdict_ttl_secs` exists, and nothing
+moves when the site still serves it — a failure inside the scraping stack
+never rotates the exit. On a confirmed freeze (401/403/429/451) the next
+`sites.max_candidates` score-ordered nodes are probed and the class moves
+to the first one the site serves. 5xx and timeouts stay `unknown` and never
+steer a switch. Verdicts persist in the state file as an advisory matrix.
+
 A deployment whose default profile is remote-only needs one bootstrap step:
 the daemon never fetches at startup, and a first fetch requires the running
 daemon's control socket. Prime the profile's `cache_file` once with a

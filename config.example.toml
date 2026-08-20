@@ -82,3 +82,15 @@ auto_switch = true             # false = a working active node never moves on it
                                # health-failure recovery and challenger-wins only log.
                                # Establishing a path when no node is active stays
                                # automatic (availability, not switching).
+
+# Anti-bot freeze awareness: sites scraping routes through, probed per node
+# with an HTTPS GET (browser UA). Verdicts steer `switch --for-site` and are
+# advisory only; they never affect health scoring.
+[sites]
+# timeout_ms = 8000
+# max_candidates = 5
+# verdict_ttl_secs = 1800
+# user_agent = "Mozilla/5.0 ..."
+
+[sites.list."www.cnbc.com"]
+url = "https://www.cnbc.com/markets/"
