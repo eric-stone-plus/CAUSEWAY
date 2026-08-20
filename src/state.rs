@@ -64,6 +64,10 @@ pub struct StateFile {
     /// invariant above. Keep access private so callers cannot create a second,
     /// stale copy of active statistics.
     subscription_nodes: BTreeMap<String, BTreeMap<String, NodeStats>>,
+    /// Anti-bot freeze matrix: site name -> node name -> last verdict.
+    /// Filled on demand by site probes; entries are advisory routing hints
+    /// and never affect health scoring.
+    pub site_verdicts: BTreeMap<String, BTreeMap<String, crate::siteprobe::SiteVerdict>>,
 }
 
 impl Default for StateFile {
@@ -78,6 +82,7 @@ impl Default for StateFile {
             subscription_source_identities: BTreeMap::new(),
             pending_subscription_sources: BTreeMap::new(),
             subscription_nodes: BTreeMap::new(),
+            site_verdicts: BTreeMap::new(),
         }
     }
 }
@@ -296,6 +301,9 @@ struct StateFileV2 {
     active_subscription: Option<String>,
     classes: BTreeMap<String, ClassState>,
     subscription_nodes: BTreeMap<String, BTreeMap<String, NodeStats>>,
+    /// Advisory freeze matrix; absent in pre-site-probe state files.
+    #[serde(default)]
+    site_verdicts: BTreeMap<String, BTreeMap<String, crate::siteprobe::SiteVerdict>>,
     #[serde(default)]
     subscription_cache_slots: BTreeMap<String, String>,
     #[serde(default)]
@@ -400,6 +408,7 @@ pub fn load(path: &Path) -> Result<Option<StateFile>, StateError> {
                 subscription_source_identities: BTreeMap::new(),
                 pending_subscription_sources: BTreeMap::new(),
                 subscription_nodes: BTreeMap::new(),
+                site_verdicts: BTreeMap::new(),
             }
         }
         STATE_VERSION => {
@@ -436,6 +445,7 @@ pub fn load(path: &Path) -> Result<Option<StateFile>, StateError> {
                 subscription_source_identities: wire.subscription_source_identities,
                 pending_subscription_sources: wire.pending_subscription_sources,
                 subscription_nodes: wire.subscription_nodes,
+                site_verdicts: wire.site_verdicts,
             }
         }
         version => {
@@ -474,6 +484,7 @@ where
         active_subscription: state.active_subscription.clone(),
         classes: state.classes.clone(),
         subscription_nodes: state.persisted_subscription_nodes()?,
+        site_verdicts: state.site_verdicts.clone(),
         subscription_cache_slots: state.subscription_cache_slots.clone(),
         subscription_source_identities: state.subscription_source_identities.clone(),
         pending_subscription_sources: state.pending_subscription_sources.clone(),
@@ -841,6 +852,7 @@ mod tests {
             subscription_source_identities: BTreeMap::new(),
             pending_subscription_sources: BTreeMap::new(),
             subscription_nodes: BTreeMap::new(),
+            site_verdicts: BTreeMap::new(),
         };
         assert!(state.activate_subscription("selected"));
         assert_eq!(state.version, STATE_VERSION);

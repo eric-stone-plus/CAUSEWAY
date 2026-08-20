@@ -19,6 +19,7 @@ mod listener;
 mod peek;
 mod probe;
 mod score;
+mod siteprobe;
 mod state;
 mod subscription;
 mod supervisor;
@@ -83,11 +84,33 @@ enum Command {
     /// Read the state file and print the active nodes and health summary
     Status,
     /// Interactive node switcher (nmtui-style); prints a plain status table
-    /// when stdout is not a terminal
+    /// when stdout is not a terminal. With --node/--for-site plus --yes it
+    /// becomes a non-interactive automation client.
     Switch {
         /// Class to manage (default: the first class in the config)
         #[arg(long)]
         class: Option<String>,
+        /// Switch to this node (non-interactive with --yes)
+        #[arg(long, requires = "yes")]
+        node: Option<String>,
+        /// Switch for one configured site: keep the incumbent when it is
+        /// not frozen, otherwise probe candidates and move to the first
+        /// node the site serves (non-interactive with --yes)
+        #[arg(long, requires = "yes", conflicts_with = "node")]
+        for_site: Option<String>,
+        /// Confirm a non-interactive switch
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Anti-bot freeze matrix: which pool nodes each configured site
+    /// currently serves. Probes are HTTPS GETs with a browser User-Agent.
+    Sites {
+        /// Refresh verdicts before printing: all sites, or one named site
+        #[arg(long, num_args = 0..=1)]
+        probe: Option<Option<String>>,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Configuration-related operations
     Config {
@@ -119,7 +142,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         .config
         .clone()
         .unwrap_or_else(config::default_config_path);
-    let command = cli.command.unwrap_or(Command::Switch { class: None });
+    let command = cli.command.unwrap_or(Command::Switch {
+        class: None,
+        node: None,
+        for_site: None,
+        yes: false,
+    });
     match &command {
         Command::Run => {
             let (cfg, warnings) = config::load(&config_path)?;
@@ -143,7 +171,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let (cfg, _) = config::load(&config_path)?;
             cmd_status(&cfg)
         }
-        Command::Switch { class } => {
+        Command::Switch {
+            class,
+            node,
+            for_site,
+            yes,
+        } => {
             init_cli_tracing();
             let (cfg, _) = config::load(&config_path)?;
             let class = match class {
@@ -161,7 +194,19 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     cfg.classes.keys().cloned().collect::<Vec<_>>().join(", ")
                 );
             }
+            if node.is_some() || for_site.is_some() {
+                if !yes {
+                    anyhow::bail!("--node/--for-site require --yes in non-interactive mode");
+                }
+                return switch::run_noninteractive(&cfg, &class, node.clone(), for_site.clone())
+                    .await;
+            }
             switch::run(&cfg, &class).await
+        }
+        Command::Sites { probe, json } => {
+            init_cli_tracing();
+            let (cfg, _) = config::load(&config_path)?;
+            cmd_sites(&cfg, probe.clone(), *json).await
         }
         Command::Config {
             action: ConfigAction::Check,
@@ -287,6 +332,82 @@ fn truncate(s: &str, max_chars: usize) -> String {
 
 /// `causeway status`: read the state file and print a summary (works even
 /// when the daemon is not running).
+async fn cmd_sites(
+    cfg: &config::Config,
+    probe: Option<Option<String>>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let client = control::Client::new(control::socket_path(cfg));
+    if let Some(scope) = probe {
+        let req = match scope.clone() {
+            Some(site) => control::Request::SiteProbe { site: Some(site) },
+            None => control::Request::SiteProbe { site: None },
+        };
+        // Full-matrix probes walk every node; allow minutes, not seconds.
+        let reply = client
+            .request(&req, std::time::Duration::from_secs(600))
+            .await?;
+        if !reply.ok {
+            anyhow::bail!("{}", reply.error.unwrap_or_else(|| "probe failed".into()));
+        }
+        if json {
+            if let Some(matrix) = reply.site_matrix {
+                println!("{}", serde_json::to_string_pretty(&matrix)?);
+            }
+            return Ok(());
+        }
+    }
+    let reply = client
+        .request(
+            &control::Request::SiteStatus,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+    if !reply.ok {
+        anyhow::bail!("{}", reply.error.unwrap_or_else(|| "status failed".into()));
+    }
+    let matrix = reply
+        .site_matrix
+        .ok_or_else(|| anyhow::anyhow!("daemon did not return a site matrix"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&matrix)?);
+        return Ok(());
+    }
+    if cfg.sites.list.is_empty() {
+        epln!("no sites configured under [sites.list]");
+        return Ok(());
+    }
+    println!(
+        "{:<28} {:<10} {:<8} {:<12} {}",
+        "SITE", "NODE", "VERDICT", "HTTP", "CHECKED"
+    );
+    for (site, nodes) in &matrix {
+        for (node, verdict) in nodes {
+            println!(
+                "{:<28} {:<10} {:<8} {:<12} {}",
+                site,
+                truncate_str(node, 10),
+                verdict.status.as_str(),
+                verdict
+                    .http_status
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                verdict.checked_unix,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max - 1).collect();
+        format!("{cut}…")
+    }
+}
+
 fn cmd_status(cfg: &config::Config) -> anyhow::Result<()> {
     let Some(st) = state::load(&cfg.state_file)? else {
         pln!(

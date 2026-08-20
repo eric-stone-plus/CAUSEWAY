@@ -209,6 +209,18 @@ pub enum Request {
     /// applied live. Class/listen layout changes require a daemon restart
     /// and are reported as an error.
     Reload,
+    /// Probe one configured site (or every configured site when omitted)
+    /// through every pool node and refresh the freeze matrix. Site probes
+    /// are HTTPS GETs with a browser User-Agent; may take tens of seconds.
+    SiteProbe { site: Option<String> },
+    /// Snapshot of the freeze matrix: site -> node -> last verdict.
+    SiteStatus,
+    /// Automation-facing switch for one site: keep the class's active node
+    /// when a fresh probe shows it is not frozen for the site; otherwise
+    /// probe score-ordered candidates and switch to the first node the
+    /// site serves. Probing happens before any switch, so a scrape failure
+    /// caused inside the scraping stack never rotates the exit.
+    SwitchForSite { class: String, site: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +232,20 @@ pub struct SwitchOutcome {
     /// True when the requested node failed its pre-check and a scored
     /// fallback won instead
     pub fallback: bool,
+}
+
+/// Outcome of a `SwitchForSite` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchForSiteOutcome {
+    pub site: String,
+    /// "kept" | "switched" | "no-candidate"
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_after: Option<String>,
+    /// Human-readable summary (probe results, why no switch happened)
+    pub detail: String,
 }
 
 /// One configured subscription profile exposed to control clients. Source
@@ -389,6 +415,12 @@ pub struct Reply {
     pub probe: Option<Vec<ProbeResult>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<Event>>,
+    /// Freeze matrix for `SiteStatus` / `SiteProbe`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_matrix: Option<BTreeMap<String, BTreeMap<String, crate::siteprobe::SiteVerdict>>>,
+    /// Outcome for `SwitchForSite`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_switch: Option<SwitchForSiteOutcome>,
     /// Free-form success detail (reload summaries etc.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -404,6 +436,8 @@ impl Reply {
             subscription_switch: None,
             probe: None,
             events: None,
+            site_matrix: None,
+            site_switch: None,
             message: None,
         }
     }
@@ -417,6 +451,8 @@ impl Reply {
             subscription_switch: None,
             probe: None,
             events: None,
+            site_matrix: None,
+            site_switch: None,
             message: None,
         }
     }
@@ -430,6 +466,8 @@ impl Reply {
             subscription_switch: None,
             probe: None,
             events: None,
+            site_matrix: None,
+            site_switch: None,
             message: None,
         }
     }
@@ -443,6 +481,8 @@ impl Reply {
             subscription_switch: Some(subscription_switch),
             probe: None,
             events: None,
+            site_matrix: None,
+            site_switch: None,
             message: None,
         }
     }
@@ -456,6 +496,8 @@ impl Reply {
             subscription_switch: None,
             probe: Some(probe),
             events: None,
+            site_matrix: None,
+            site_switch: None,
             message: None,
         }
     }
@@ -469,6 +511,8 @@ impl Reply {
             subscription_switch: None,
             probe: None,
             events: Some(events),
+            site_matrix: None,
+            site_switch: None,
             message: None,
         }
     }
@@ -482,7 +526,41 @@ impl Reply {
             subscription_switch: None,
             probe: None,
             events: None,
+            site_matrix: None,
+            site_switch: None,
             message: Some(message.into()),
+        }
+    }
+
+    pub fn ok_site_matrix(
+        site_matrix: BTreeMap<String, BTreeMap<String, crate::siteprobe::SiteVerdict>>,
+    ) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            status: None,
+            switch: None,
+            subscription_switch: None,
+            probe: None,
+            events: None,
+            site_matrix: Some(site_matrix),
+            site_switch: None,
+            message: None,
+        }
+    }
+
+    pub fn ok_site_switch(site_switch: SwitchForSiteOutcome) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            status: None,
+            switch: None,
+            subscription_switch: None,
+            probe: None,
+            events: None,
+            site_matrix: None,
+            site_switch: Some(site_switch),
+            message: None,
         }
     }
 
@@ -495,6 +573,8 @@ impl Reply {
             subscription_switch: None,
             probe: None,
             events: None,
+            site_matrix: None,
+            site_switch: None,
             message: None,
         }
     }
