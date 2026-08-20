@@ -228,19 +228,29 @@ impl TlsClient {
         Ok(())
     }
 
-    /// Read one batch of ciphertext and hand it to the connection.
+    /// Read one batch of ciphertext and hand it to the connection. One TCP
+    /// segment regularly carries several TLS records (ServerHello +
+    /// Certificate + ...); every byte must be fed to the connection or the
+    /// record stream desynchronizes and decryption fails.
     async fn pull_ciphertext(&mut self) -> anyhow::Result<()> {
         self.sock.readable().await?;
         let mut cipher = [0u8; 16384];
         match self.sock.try_read(&mut cipher) {
             Ok(0) => bail!("TLS peer closed the connection"),
             Ok(n) => {
-                self.conn
-                    .read_tls(&mut &cipher[..n])
-                    .context("decode TLS record")?;
-                self.conn
-                    .process_new_packets()
-                    .context("process TLS packets")?;
+                let mut pending: &[u8] = &cipher[..n];
+                while !pending.is_empty() {
+                    let consumed = self
+                        .conn
+                        .read_tls(&mut pending)
+                        .context("decode TLS record")?;
+                    if consumed == 0 {
+                        break;
+                    }
+                    self.conn
+                        .process_new_packets()
+                        .context("process TLS packets")?;
+                }
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
