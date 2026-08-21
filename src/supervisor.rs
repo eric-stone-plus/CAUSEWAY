@@ -2236,12 +2236,17 @@ pub async fn run(cfg: Config, config_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/causeway-run"));
     let workspace = AdapterWorkspace::create(&work_dir)?;
     let plane = Arc::new(DispatchPlane::new(
-        SslocalPlane::new(
+        SslocalPlane::new_with_direct_hosts(
             cfg.sslocal_bin.clone(),
             Arc::clone(&workspace),
             cfg.obfs_plugin_bin.clone(),
+            cfg.routing.direct_hosts.clone(),
         ),
-        SingboxPlane::new(cfg.singbox_bin.clone(), Arc::clone(&workspace)),
+        SingboxPlane::new_with_direct_hosts(
+            cfg.singbox_bin.clone(),
+            Arc::clone(&workspace),
+            cfg.routing.direct_hosts.clone(),
+        ),
         workspace,
     ));
     let events = Arc::new(EventLog::new(200));
@@ -3926,6 +3931,9 @@ listen = "127.0.0.1:17878"
         changed.push(candidate);
         let mut candidate = running.clone();
         candidate.selection.ema_alpha = 0.5;
+        changed.push(candidate);
+        let mut candidate = running.clone();
+        candidate.routing.direct_hosts = vec!["api.example.test".to_string()];
         changed.push(candidate);
 
         for candidate in changed {

@@ -6,7 +6,8 @@
 //! - No GUI, no HTTP/metrics servers; runtime control is exactly one local
 //!   Unix socket (mode 0600, see `control.rs`) used by the bundled `switch`
 //!   subcommand; one config file + one systemd user service;
-//! - Stability over latency; explicit over clever (no SNI-sniffing rule engine).
+//! - Stability over latency; explicit over clever (the listener does not
+//!   inspect SNI or proxy targets; static exact-host routing is adapter-owned).
 
 mod config;
 mod control;
@@ -378,8 +379,8 @@ async fn cmd_sites(
         return Ok(());
     }
     println!(
-        "{:<28} {:<10} {:<8} {:<12} {}",
-        "SITE", "NODE", "VERDICT", "HTTP", "CHECKED"
+        "{:<28} {:<10} {:<8} {:<12} CHECKED",
+        "SITE", "NODE", "VERDICT", "HTTP"
     );
     for (site, nodes) in &matrix {
         for (node, verdict) in nodes {
@@ -510,6 +511,10 @@ fn cmd_config_check(path: &std::path::Path) -> anyhow::Result<()> {
         "  selection: hysteresis {:.2}, ema_alpha {:.2}",
         cfg.selection.hysteresis,
         cfg.selection.ema_alpha
+    );
+    pln!(
+        "  routing: {} exact direct host(s)",
+        cfg.routing.direct_hosts.len()
     );
 
     // Offline subscription parse (print counts only, never node details —

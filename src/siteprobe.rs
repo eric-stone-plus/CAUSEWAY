@@ -372,12 +372,10 @@ mod tests {
         // Direct socket-level check of the CONNECT + status-line parsing:
         // the full helper CONNECTs then hands off to TLS, so exercise the
         // socket reader directly here.
-        use tokio::io::AsyncWriteExt as _;
         let mut sock = TcpStream::connect(addr).await.unwrap();
         sock.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
             .await
             .unwrap();
-        use tokio::io::AsyncReadExt as _;
         let code = read_status_line_socket(&mut sock).await.unwrap();
         assert_eq!(code, 200);
         sock.write_all(b"GO\n").await.unwrap();

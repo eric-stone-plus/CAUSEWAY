@@ -1,8 +1,10 @@
 //! First-byte protocol classification.
 //!
-//! Design constraint "explicit over clever": no SNI sniffing, no rule engine —
-//! only the first byte is inspected: a SOCKS5 handshake starts with 0x05; an
-//! HTTP method (GET/CONNECT/...) starts with an ASCII letter.
+//! Design constraint "explicit over clever": no SNI sniffing, target parsing,
+//! or general-purpose rule engine — only the first byte is inspected: a
+//! SOCKS5 handshake starts with 0x05; an HTTP method (GET/CONNECT/...) starts
+//! with an ASCII letter. Static exact-host routing, when configured, belongs
+//! to the supervised adapter rather than this classifier.
 //! The classification result is used only to choose sslocal's socks / http
 //! local port; afterwards it is byte-for-byte L4 passthrough.
 

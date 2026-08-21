@@ -32,8 +32,11 @@ cargo clippy           # before committing (not a hard gate)
 3. Stability over latency: switch conservatively, never flap eagerly.
    Hysteresis lives in `src/score.rs`; any change must update its unit tests
    in the same commit.
-4. Explicit over clever: no payload inspection, no rule engine. Protocol
-   detection is only the first-byte classifier in `src/peek.rs`.
+4. Explicit over clever: the Rust gateway performs no payload inspection,
+   target parsing, or general-purpose rule engine. Protocol detection is only
+   the first-byte classifier in `src/peek.rs`. A user-configured exact-host
+   allowlist may be compiled into supervised adapters for direct API egress;
+   the listener itself never evaluates those destinations.
 5. **No real endpoint data in the repo, ever** (servers, ports, credentials,
    manifest contents). Test fixtures must use documentation addresses
    (RFC 5737). Manifests are read at runtime only, from files outside the
