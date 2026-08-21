@@ -30,9 +30,13 @@ socket used by the bundled `switch` subcommand.
   atomically (tmp + rename). Histories are isolated by subscription profile,
   so equal endpoint names from different sources never contaminate each
   other.
-- **Explicit over clever.** No payload inspection, no rule engine. Each
-  inbound connection is classified by its first byte and piped byte-for-byte
-  from then on.
+- **Explicit over clever.** The Rust listener performs no payload inspection,
+  target parsing, or general-purpose rule evaluation. Each inbound connection
+  is classified by its first byte and piped byte-for-byte from then on.
+  An optional, exact-host allowlist (`routing.direct_hosts`) is compiled into
+  the supervised adapters, so approved API destinations can connect directly
+  while all unmatched destinations retain the active node. Changes to this
+  list take effect after the daemon is restarted.
 
 ## Engineering
 

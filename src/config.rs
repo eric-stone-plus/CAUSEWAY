@@ -1,12 +1,13 @@
 //! TOML config loading and validation. Default path
 //! `~/.config/causeway/config.toml`, overridable with `--config`.
 
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context};
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 
 pub fn default_config_path() -> PathBuf {
@@ -56,6 +57,8 @@ pub struct Config {
     pub selection: SelectionConfig,
     #[serde(default)]
     pub sites: SitesConfig,
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -97,6 +100,88 @@ pub const LEGACY_SUBSCRIPTION_NAME: &str = "default";
 pub struct ClassConfig {
     /// Loopback listen address for this class, e.g. 127.0.0.1:17878
     pub listen: SocketAddr,
+}
+
+/// Static destination routing compiled into each supervised data plane.
+///
+/// Host matching is deliberately exact: widening one entry to an entire DNS
+/// suffix must be an explicit future schema change, not an accidental side
+/// effect of accepting a convenient shorthand here.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct RoutingConfig {
+    #[serde(default, deserialize_with = "deserialize_direct_hosts")]
+    pub direct_hosts: Vec<String>,
+}
+
+fn deserialize_direct_hosts<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let configured = Vec::<String>::deserialize(deserializer)?;
+    let mut seen = BTreeSet::new();
+    let mut direct_hosts = Vec::with_capacity(configured.len());
+    for configured_host in configured {
+        let host = canonical_direct_host(&configured_host).map_err(D::Error::custom)?;
+        if !seen.insert(host.clone()) {
+            return Err(D::Error::custom(format!(
+                "routing.direct_hosts contains duplicate hostname {host:?}"
+            )));
+        }
+        direct_hosts.push(host);
+    }
+    Ok(direct_hosts)
+}
+
+fn canonical_direct_host(value: &str) -> Result<String, String> {
+    let invalid = |reason: &str| {
+        Err(format!(
+            "invalid routing.direct_hosts entry {value:?}: {reason}"
+        ))
+    };
+
+    if value.is_empty() {
+        return invalid("hostname must not be empty");
+    }
+    if !value.is_ascii() {
+        return invalid("hostname must contain ASCII DNS labels only");
+    }
+    if value.len() > 253 {
+        return invalid("hostname must be at most 253 bytes");
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return invalid("IP literals are not allowed");
+    }
+    if !value.contains('.') {
+        return invalid("hostname must contain at least one dot");
+    }
+
+    let labels: Vec<&str> = value.split('.').collect();
+    if labels
+        .iter()
+        .all(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return invalid("numeric dotted addresses are not allowed");
+    }
+    for label in labels {
+        if label.is_empty() {
+            return invalid("DNS labels must not be empty");
+        }
+        if label.len() > 63 {
+            return invalid("each DNS label must be at most 63 bytes");
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return invalid("each DNS label must start and end with an ASCII letter or digit");
+        }
+        if !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return invalid("DNS labels may contain only ASCII letters, digits, and hyphens");
+        }
+    }
+
+    Ok(value.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -335,6 +420,7 @@ impl Config {
                 );
             }
         }
+        self.routing.validate()?;
         self.validate_writable_path_spellings()?;
         let mut protected_paths = vec![
             (self.state_file.clone(), "persistent state file".to_string()),
@@ -530,6 +616,22 @@ impl Config {
         }
 
         validate_role_collisions(&roles)
+    }
+}
+
+impl RoutingConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        let mut seen = BTreeSet::new();
+        for host in &self.direct_hosts {
+            let canonical = canonical_direct_host(host).map_err(anyhow::Error::msg)?;
+            if canonical != *host {
+                bail!("routing.direct_hosts entry {host:?} is not canonical; use {canonical:?}");
+            }
+            if !seen.insert(canonical.clone()) {
+                bail!("routing.direct_hosts contains duplicate hostname {canonical:?}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1033,6 +1135,7 @@ listen = "127.0.0.1:17878"
     fn minimal_config_gets_defaults() {
         let mut cfg: Config = toml::from_str(MINIMAL).unwrap();
         cfg.expand_paths();
+        assert!(cfg.routing.direct_hosts.is_empty());
         assert_eq!(cfg.probe.interval_secs, 600);
         assert_eq!(cfg.probe.timeout_ms, 3000);
         assert_eq!(cfg.probe.concurrency, 32);
@@ -1058,6 +1161,65 @@ listen = "127.0.0.1:17878"
             home.join(".local/share/causeway/bin/sing-box"),
             "sing-box default path"
         );
+    }
+
+    #[test]
+    fn direct_hosts_are_canonicalized_on_deserialization() {
+        let text = r#"
+direct_hosts = ["API.Example.COM", "open.example.org"]
+"#;
+        let routing: RoutingConfig = toml::from_str(text).unwrap();
+        assert_eq!(
+            routing.direct_hosts,
+            [
+                "api.example.com".to_string(),
+                "open.example.org".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_hosts_reject_canonical_duplicates() {
+        let text = r#"
+direct_hosts = ["MiMo.Example.com", "mimo.example.COM"]
+"#;
+        let error = toml::from_str::<RoutingConfig>(text)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicate hostname"), "{error}");
+    }
+
+    #[test]
+    fn direct_hosts_reject_invalid_hostnames() {
+        let invalid_hosts = vec![
+            "".to_string(),
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "123.456.789.012".to_string(),
+            "mimo..example.com".to_string(),
+            "-mimo.example.com".to_string(),
+            "mimo-.example.com".to_string(),
+            "mimo_example.com".to_string(),
+            "mimo.\u{4f8b}\u{5b50}.com".to_string(),
+            "a".repeat(64),
+        ];
+        for host in invalid_hosts {
+            let text = format!("direct_hosts = [{host:?}]\n");
+            let result = toml::from_str::<RoutingConfig>(&text);
+            assert!(result.is_err(), "accepted invalid direct host {host:?}");
+        }
+
+        let too_long = format!("{}.example.com", "a".repeat(250));
+        let text = format!("direct_hosts = [{too_long:?}]\n");
+        assert!(toml::from_str::<RoutingConfig>(&text).is_err());
+    }
+
+    #[test]
+    fn config_validation_requires_canonical_direct_hosts() {
+        let mut cfg: Config = toml::from_str(MINIMAL).unwrap();
+        cfg.routing.direct_hosts = vec!["API.Example.COM".to_string()];
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("is not canonical"), "{error}");
     }
 
     #[test]

@@ -20,6 +20,15 @@ obfs_plugin_bin = "~/.local/share/causeway/bin/obfs-local"
 # activation with a clear error)
 singbox_bin = "~/.local/share/causeway/bin/sing-box"
 
+# Exact destination hostnames compiled into both supervised adapters as
+# direct-connect rules. Every other destination keeps using the active node.
+# Entries are ASCII DNS hostnames (no wildcards, paths, ports, or IPs); the
+# list is intentionally empty in this public example. Add deployment-specific
+# hosts only in the private config outside the repository, then restart the
+# daemon to rebuild its supervised adapters.
+[routing]
+direct_hosts = []
+
 # Named subscriptions are mutually exclusive: exactly one profile supplies
 # the live node pool. `default` is used on first run; a successful runtime
 # selection may be persisted separately.
@@ -51,8 +60,8 @@ cache_file = "~/.local/share/causeway/subscriptions/remote-backup.yaml"
 # files = ["~/.local/share/causeway/subscriptions/example.yaml"]
 
 # Traffic classes → loopback listen addresses. Clients pick a listener by
-# purpose; CAUSEWAY does no rule-based splitting. The ports below are
-# placeholders — choose your own.
+# purpose; the Rust listener only classifies HTTP/SOCKS5 by first byte. The
+# static exact-host rules above are compiled into the supervised adapters.
 [classes.dev]
 listen = "127.0.0.1:17878"      # development traffic
 

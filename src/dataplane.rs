@@ -875,18 +875,44 @@ pub struct SslocalPlane {
     /// Absolute path of the simple-obfs plugin (SIP003); required to exist
     /// only when a node carries plugin parameters
     obfs_plugin_bin: PathBuf,
+    /// Validated exact destination hostnames that bypass the active node.
+    direct_hosts: Vec<String>,
     ready_timeout: Duration,
 }
 
 impl SslocalPlane {
-    pub fn new(bin: PathBuf, workspace: Arc<AdapterWorkspace>, obfs_plugin_bin: PathBuf) -> Self {
+    pub fn new_with_direct_hosts(
+        bin: PathBuf,
+        workspace: Arc<AdapterWorkspace>,
+        obfs_plugin_bin: PathBuf,
+        direct_hosts: Vec<String>,
+    ) -> Self {
         Self {
             bin,
             workspace,
             obfs_plugin_bin,
+            direct_hosts,
             ready_timeout: Duration::from_secs(10),
         }
     }
+}
+
+/// Compile exact hostnames into shadowsocks-rust's native ACL syntax.
+///
+/// The single `|` form is deliberately exact (unlike `||`, which also
+/// matches subdomains). Black-list mode keeps every unmatched destination on
+/// the active proxy node.
+fn build_sslocal_acl(direct_hosts: &[String]) -> Option<String> {
+    if direct_hosts.is_empty() {
+        return None;
+    }
+    let mut acl = String::from("[proxy_all]\n\n[bypass_list]\n");
+    for host in direct_hosts {
+        acl.push('|');
+        acl.push_str(host);
+        acl.push('\n');
+    }
+    Some(acl)
 }
 
 /// Build the sslocal config (a pure function, so unit tests can assert the
@@ -897,11 +923,12 @@ impl SslocalPlane {
 /// When a node carries simple-obfs parameters, both locals get the SIP003
 /// plugin/plugin_opts injected — without them sslocal would listen happily
 /// while every upstream times out (a P0 incident on record).
-fn build_sslocal_config(
+fn build_sslocal_config_with_acl(
     node: &SsNode,
     socks_addr: SocketAddr,
     http_addr: SocketAddr,
     obfs_bin: &std::path::Path,
+    acl_path: Option<&std::path::Path>,
 ) -> serde_json::Value {
     let local = |addr: SocketAddr, protocol: &str| {
         let mut l = serde_json::json!({
@@ -922,12 +949,17 @@ fn build_sslocal_config(
         }
         l
     };
-    serde_json::json!({
+    let mut config = serde_json::json!({
         "locals": [
             local(socks_addr, "socks"),
             local(http_addr, "http"),
         ]
-    })
+    });
+    if let Some(path) = acl_path {
+        // A global ACL applies identically to both local protocols.
+        config["acl"] = serde_json::Value::String(path.to_string_lossy().into_owned());
+    }
+    config
 }
 
 pub struct SslocalHandle {
@@ -935,6 +967,7 @@ pub struct SslocalHandle {
     socks_addr: SocketAddr,
     http_addr: SocketAddr,
     config: PrivateConfig,
+    acl_config: Option<PrivateConfig>,
     node_name: String,
 }
 
@@ -944,6 +977,9 @@ impl Drop for SslocalHandle {
         // path kills and reaps the owned child under a strict bound in `stop`;
         // the config guard always unlinks the credential file.
         self.config.cleanup().ok();
+        if let Some(acl) = &mut self.acl_config {
+            acl.cleanup().ok();
+        }
     }
 }
 
@@ -967,8 +1003,13 @@ impl DataPlaneHandle for SslocalHandle {
     async fn stop(&mut self) -> anyhow::Result<()> {
         let process_result = stop_owned_child(&mut self.child, "sslocal").await;
         let config_result = self.config.cleanup();
+        let acl_result = self
+            .acl_config
+            .as_mut()
+            .map_or(Ok(()), PrivateConfig::cleanup);
         process_result?;
         config_result?;
+        acl_result?;
         info!(node = %self.node_name, "sslocal stopped");
         Ok(())
     }
@@ -997,7 +1038,19 @@ impl DataPlane for SslocalPlane {
         }
         let socks_addr = ports.socks_addr;
         let http_addr = ports.http_addr;
-        let config = build_sslocal_config(&node, socks_addr, http_addr, &self.obfs_plugin_bin);
+        // Keep the native ACL in the same private, handle-owned workspace as
+        // credential configs. Reusing the strict sslocal filename family
+        // also keeps crash cleanup fail-closed without broadening its scope.
+        let acl_config = build_sslocal_acl(&self.direct_hosts)
+            .map(|acl| PrivateConfig::create(self.workspace.path(), "sslocal", acl.as_bytes()))
+            .transpose()?;
+        let config = build_sslocal_config_with_acl(
+            &node,
+            socks_addr,
+            http_addr,
+            &self.obfs_plugin_bin,
+            acl_config.as_ref().map(PrivateConfig::path),
+        );
         let private_config = PrivateConfig::create(
             self.workspace.path(),
             "sslocal",
@@ -1027,6 +1080,7 @@ impl DataPlane for SslocalPlane {
             socks_addr,
             http_addr,
             config: private_config,
+            acl_config,
             node_name: node.name.clone(),
         };
 
@@ -1080,14 +1134,22 @@ pub struct SingboxPlane {
     bin: PathBuf,
     /// Temporary config directory (one JSON per instance)
     workspace: Arc<AdapterWorkspace>,
+    /// Validated exact destination hostnames that use sing-box's direct
+    /// outbound instead of the active node.
+    direct_hosts: Vec<String>,
     ready_timeout: Duration,
 }
 
 impl SingboxPlane {
-    pub fn new(bin: PathBuf, workspace: Arc<AdapterWorkspace>) -> Self {
+    pub fn new_with_direct_hosts(
+        bin: PathBuf,
+        workspace: Arc<AdapterWorkspace>,
+        direct_hosts: Vec<String>,
+    ) -> Self {
         Self {
             bin,
             workspace,
+            direct_hosts,
             ready_timeout: Duration::from_secs(10),
         }
     }
@@ -1098,10 +1160,11 @@ impl SingboxPlane {
 ///
 /// One process, two inbounds: socks + http — the same local layout as the
 /// sslocal plane, so listener and supervisor stay protocol-agnostic.
-fn build_singbox_config(
+fn build_singbox_config_with_direct_hosts(
     node: &AnytlsNode,
     socks_addr: SocketAddr,
     http_addr: SocketAddr,
+    direct_hosts: &[String],
 ) -> serde_json::Value {
     let inbound = |addr: SocketAddr, protocol: &str| {
         serde_json::json!({
@@ -1128,7 +1191,7 @@ fn build_singbox_config(
     if node.skip_cert_verify {
         tls["insecure"] = serde_json::Value::Bool(true);
     }
-    serde_json::json!({
+    let mut config = serde_json::json!({
         "log": {"level": "warn"},
         // Constrain the adapter shape explicitly. A provider manifest can
         // select only this outbound; it can never request TUN, auto-routing,
@@ -1149,7 +1212,18 @@ fn build_singbox_config(
             "auto_detect_interface": false,
             "final": "out",
         },
-    })
+    });
+    if !direct_hosts.is_empty() {
+        config["outbounds"]
+            .as_array_mut()
+            .expect("generated outbounds are an array")
+            .push(serde_json::json!({"type": "direct", "tag": "direct"}));
+        config["route"]["rules"] = serde_json::json!([{
+            "domain": direct_hosts,
+            "outbound": "direct",
+        }]);
+    }
+    config
 }
 
 pub struct SingboxHandle {
@@ -1209,7 +1283,12 @@ impl DataPlane for SingboxPlane {
         }
         let socks_addr = ports.socks_addr;
         let http_addr = ports.http_addr;
-        let config = build_singbox_config(&node, socks_addr, http_addr);
+        let config = build_singbox_config_with_direct_hosts(
+            &node,
+            socks_addr,
+            http_addr,
+            &self.direct_hosts,
+        );
         let private_config = PrivateConfig::create(
             self.workspace.path(),
             "singbox",
@@ -1575,7 +1654,7 @@ mod tests {
             host: Some("cdn.example.com".to_string()),
         }));
         let obfs_bin = std::path::Path::new("/home/u/.local/share/causeway/bin/obfs-local");
-        let cfg = build_sslocal_config(&node, socks(), http(), obfs_bin);
+        let cfg = build_sslocal_config_with_acl(&node, socks(), http(), obfs_bin, None);
         let locals = cfg["locals"].as_array().unwrap();
         assert_eq!(locals.len(), 2, "still one process with two locals");
         for l in locals {
@@ -1601,11 +1680,12 @@ mod tests {
         let node = ss_node(None);
         // A plugin-free node does not require the plugin binary to exist (any
         // path will do)
-        let cfg = build_sslocal_config(
+        let cfg = build_sslocal_config_with_acl(
             &node,
             socks(),
             http(),
             std::path::Path::new("/nonexistent/obfs-local"),
+            None,
         );
         let locals = cfg["locals"].as_array().unwrap();
         for l in locals {
@@ -1615,6 +1695,31 @@ mod tests {
             );
             assert!(l.get("plugin_opts").is_none());
         }
+    }
+
+    #[test]
+    fn sslocal_acl_uses_exact_hosts_and_proxies_the_rest() {
+        let hosts = vec![
+            "api.example.test".to_string(),
+            "open.example.test".to_string(),
+        ];
+        assert_eq!(
+            build_sslocal_acl(&hosts).as_deref(),
+            Some("[proxy_all]\n\n[bypass_list]\n|api.example.test\n|open.example.test\n")
+        );
+        assert!(build_sslocal_acl(&[]).is_none());
+
+        let node = ss_node(None);
+        let acl_path = std::path::Path::new("/tmp/causeway-test-acl");
+        let cfg = build_sslocal_config_with_acl(
+            &node,
+            socks(),
+            http(),
+            std::path::Path::new("/nonexistent/obfs-local"),
+            Some(acl_path),
+        );
+        assert_eq!(cfg["acl"].as_str(), Some("/tmp/causeway-test-acl"));
+        assert_eq!(cfg["locals"].as_array().unwrap().len(), 2);
     }
 
     fn anytls_node(
@@ -1643,7 +1748,7 @@ mod tests {
             Some("firefox"),
             true,
         );
-        let cfg = build_singbox_config(&node, socks(), http());
+        let cfg = build_singbox_config_with_direct_hosts(&node, socks(), http(), &[]);
 
         let inbounds = cfg["inbounds"].as_array().unwrap();
         assert_eq!(inbounds.len(), 2, "one process with two inbounds");
@@ -1675,7 +1780,7 @@ mod tests {
     #[test]
     fn singbox_config_defaults_when_optional_fields_absent() {
         let node = anytls_node(None, None, None, false);
-        let cfg = build_singbox_config(&node, socks(), http());
+        let cfg = build_singbox_config_with_direct_hosts(&node, socks(), http(), &[]);
         let tls = &cfg["outbounds"][0]["tls"];
         assert!(
             tls.get("server_name").is_none(),
@@ -1695,5 +1800,29 @@ mod tests {
             "chrome",
             "default fingerprint"
         );
+    }
+
+    #[test]
+    fn singbox_config_compiles_exact_direct_hosts() {
+        let node = anytls_node(None, None, None, false);
+        let hosts = vec![
+            "api.example.test".to_string(),
+            "open.example.test".to_string(),
+        ];
+        let cfg = build_singbox_config_with_direct_hosts(&node, socks(), http(), &hosts);
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds.len(), 2);
+        assert_eq!(
+            outbounds[1],
+            serde_json::json!({"type": "direct", "tag": "direct"})
+        );
+        assert_eq!(
+            cfg["route"]["rules"],
+            serde_json::json!([{
+                "domain": ["api.example.test", "open.example.test"],
+                "outbound": "direct",
+            }])
+        );
+        assert_eq!(cfg["route"]["final"], "out");
     }
 }
