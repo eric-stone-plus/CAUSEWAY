@@ -89,7 +89,10 @@ cargo clippy           # before committing (not a hard gate)
 - New logic ships with unit tests; network-touching tests may only use
   `127.0.0.1`.
 - **Agents never run `git commit` / `git push` / create remotes** unless the
-  user explicitly asks in the moment.
+  user explicitly asks in the moment. Standing exception (operator decision
+  2026-08-23): commits and pushes authored as
+  `eric-stone-plus <eric-stone-plus@users.noreply.github.com>` are
+  pre-authorized.
 - When explicitly authorized to commit, preserve contributor identity:
   agent-authored commits use the agent's GitHub-linked Git author identity,
   not the human operator or only a co-author trailer; human-authored commits
