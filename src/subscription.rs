@@ -637,6 +637,12 @@ fn prepare_remote_profile_with(
     })
 }
 
+/// User-Agent sent when fetching remote subscription manifests. Subscription
+/// portals sit behind WAFs that whitelist clash-family client UAs (verified
+/// 2026-08-26: `clash-verge/v2.2.3` receives the manifest while curl's
+/// default UA and real browsers are refused with 403).
+const SUBSCRIPTION_FETCH_USER_AGENT: &str = "clash-verge/v2.2.3";
+
 fn fetch_remote_manifest_with(
     curl_bin: &Path,
     url_file: &Path,
@@ -708,7 +714,13 @@ fn fetch_remote_manifest_with(
         .spawn()
         .map_err(SubscriptionError::FetchStart)?;
 
-    let config = format!("url = \"{}\"\n", escape_curl_config(url));
+    // The UA rides in the stdin config alongside the URL so argv stays free
+    // of any provider-facing detail.
+    let config = format!(
+        "user-agent = \"{}\"\nurl = \"{}\"\n",
+        SUBSCRIPTION_FETCH_USER_AGENT,
+        escape_curl_config(url)
+    );
     communicate_with_fetcher(child, config.as_bytes())
 }
 
