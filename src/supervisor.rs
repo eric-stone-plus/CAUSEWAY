@@ -989,11 +989,19 @@ async fn switch_subscription_locked(
                     .map(|active| active.node.name().to_string())
             })
             .flatten();
+        // A subscription switch (not a refresh) must bypass the region
+        // allowlist: the new profile's node naming convention may not match
+        // the operator's region filter designed for the incumbent profile.
+        let effective_regions: &[String] = if refreshed {
+            &ctx.cfg.selection.regions
+        } else {
+            &[]
+        };
         let candidates = profile_candidates(
             prepared.nodes(),
             stats.as_ref(),
             preferred.as_deref(),
-            &ctx.cfg.selection.regions,
+            effective_regions,
         );
         let mut activated = None;
         for candidate in candidates.into_iter().take(MAX_SWITCH_CANDIDATES) {
