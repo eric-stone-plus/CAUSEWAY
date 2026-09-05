@@ -1269,9 +1269,21 @@ fn class_snapshot(ctx: &Ctx, class: &str) -> Option<control::StatusSnapshot> {
                 available_subscriptions,
             )
         };
-        let (cs, nodes) = {
+        let (cs, nodes, classes) = {
             let st = lock_state(&ctx.state);
-            (st.classes.get(class)?.clone(), st.nodes.clone())
+            let cs = st.classes.get(class)?.clone();
+            let classes = ctx
+                .cfg
+                .classes
+                .iter()
+                .map(|(name, class_cfg)| control::ClassOverview {
+                    name: name.clone(),
+                    listen: class_cfg.listen.to_string(),
+                    active_node: st.classes.get(name).and_then(|c| c.active_node.clone()),
+                    generation: st.classes.get(name).map(|c| c.generation).unwrap_or(0),
+                })
+                .collect();
+            (cs, st.nodes.clone(), classes)
         };
         let unchanged = ctx
             .subscriptions
@@ -1305,6 +1317,7 @@ fn class_snapshot(ctx: &Ctx, class: &str) -> Option<control::StatusSnapshot> {
                 subscription_txn_in_progress: Some(txn_before != 0 || txn_after != 0),
                 available_subscriptions,
                 available_nodes,
+                classes,
             });
         }
     }

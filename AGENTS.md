@@ -53,7 +53,8 @@ cargo clippy           # before committing (not a hard gate)
   the state dir, newline-delimited JSON (ping/status/switch), plus the
   one-shot client used by `causeway switch`.
 - `src/switch.rs` — nmtui-style interactive node switcher (ratatui +
-  crossterm); plain status report when stdout is not a terminal.
+  crossterm) with an always-visible class strip; plain status report when
+  stdout is not a terminal.
 - `src/config.rs` — TOML loading, `~` expansion, hard validation.
 - `src/subscription.rs` — offline endpoint-manifest parsing, per-entry fault
   tolerance; unsupported entry types are rejected explicitly at parse time.

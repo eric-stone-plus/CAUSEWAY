@@ -1,9 +1,11 @@
 //! `causeway`'s primary interface: an nmtui-style dashboard.
 //!
 //! A full-screen TUI (ratatui + crossterm) with live data from the daemon's
-//! control socket: node table (score, RTT, per-node traffic), recent-events
-//! feed, multi-class tabs, arrow keys to select, Enter to switch (the daemon
-//! runs the normal check-before-switch flow with reason "manual"), `t` to run
+//! control socket: an always-visible class strip (every listener and its
+//! active node), a node table for the focused class (score, RTT, per-node
+//! traffic), recent-events feed, Tab/←/→ to change class, arrow keys to
+//! select a node, Enter to switch only the focused class (the daemon runs
+//! the normal check-before-switch flow with reason "manual"), `t` to run
 //! an end-to-end latency test of every node, `s` to switch subscription
 //! profiles (`e` inside the picker replaces a remote profile's credential
 //! URL via masked input — atomically written 0600, never rendered), q to
@@ -26,7 +28,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::Config;
 use crate::control::{self, Client, Request, StatusSnapshot};
-use crate::score::score_cmp;
+use crate::score::{score_cmp, success_cmp};
 use crate::state;
 use crate::subscription;
 use crate::{epln, pln};
@@ -44,10 +46,16 @@ const SUBSCRIPTION_SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Poll the daemon for fresh data this often while idle
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
-/// Event feed height (rows)
-const EVENTS_ROWS: u16 = 4;
+/// Event feed minimum height (rows, including the bordered block).
+/// Leftover terminal rows go here instead of stretching the node table.
+const EVENTS_MIN_ROWS: u16 = 4;
 /// Footer height (rows)
-const FOOTER_ROWS: u16 = 4;
+const FOOTER_ROWS: u16 = 3;
+/// Bordered block chrome (top/bottom borders + header row) for the class strip
+/// and the node table.
+const TABLE_CHROME: u16 = 3;
+/// Floor for the node table so a tiny pool still has a usable pane.
+const MIN_NODE_TABLE_ROWS: u16 = 6;
 
 struct SubscriptionPicker {
     entries: Vec<control::SubscriptionSummary>,
@@ -755,14 +763,19 @@ async fn tui_loop(
                                 open_subscription_picker(app);
                             }
                         }
-                        KeyCode::Tab | KeyCode::BackTab => {
+                        KeyCode::Tab
+                        | KeyCode::BackTab
+                        | KeyCode::Left
+                        | KeyCode::Right => {
                             if app.busy || app.cfg_classes.len() < 2 {
                                 continue;
                             }
                             let n = app.cfg_classes.len();
-                            app.class_idx = match key.code {
-                                KeyCode::Tab => (app.class_idx + 1) % n,
-                                _ => (app.class_idx + n - 1) % n,
+                            let forward = matches!(key.code, KeyCode::Tab | KeyCode::Right);
+                            app.class_idx = if forward {
+                                (app.class_idx + 1) % n
+                            } else {
+                                (app.class_idx + n - 1) % n
                             };
                             app.snapshot = None;
                             app.generation_known = false;
@@ -1211,6 +1224,7 @@ fn refresh_from_file(app: &mut App) {
         app.subs = available_nodes.clone();
         let cs = st.classes.get(app.class());
         app.generation_known = cs.is_some();
+        let classes = class_overviews_from_state(app, &st);
         app.snapshot = Some(StatusSnapshot {
             class: app.class().to_string(),
             active_node: cs.and_then(|c| c.active_node.clone()),
@@ -1225,6 +1239,7 @@ fn refresh_from_file(app: &mut App) {
             subscription_txn_in_progress: None,
             available_subscriptions: app.fallback_subscriptions.clone(),
             available_nodes,
+            classes,
         });
     } else {
         // A missing, unreadable, or corrupt state file provides no evidence
@@ -1433,7 +1448,7 @@ fn ordered_names(
                 (Some(false), Some(true)) => return Ordering::Greater,
                 (Some(true), Some(true)) => {
                     let stability = match (sa, sb) {
-                        (Some(sa), Some(sb)) => sb.success_ema.total_cmp(&sa.success_ema),
+                        (Some(sa), Some(sb)) => success_cmp(sb.success_ema, sa.success_ema),
                         (Some(_), None) => Ordering::Less,
                         (None, Some(_)) => Ordering::Greater,
                         (None, None) => Ordering::Equal,
@@ -1519,11 +1534,104 @@ fn node_table_column_lengths(total_width: u16) -> [u16; 7] {
     widths
 }
 
+#[cfg(test)]
 fn generation_label(snapshot: Option<&StatusSnapshot>, generation_known: bool) -> String {
     snapshot
         .filter(|_| generation_known)
         .map(|snapshot| snapshot.generation.to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn class_overviews_from_state(app: &App, st: &state::StateFile) -> Vec<control::ClassOverview> {
+    app.cfg_classes
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let cs = st.classes.get(name);
+            control::ClassOverview {
+                name: name.clone(),
+                listen: app
+                    .listens
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "-".into()),
+                active_node: cs.and_then(|c| c.active_node.clone()),
+                generation: cs.map(|c| c.generation).unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
+/// Prefer the daemon's all-class strip; synthesize from local config when an
+/// older daemon omitted it so the operator still sees every configured
+/// gateway.
+fn class_overviews(app: &App) -> Vec<control::ClassOverview> {
+    if let Some(classes) = app.snapshot.as_ref().map(|s| &s.classes) {
+        if !classes.is_empty() {
+            return classes.clone();
+        }
+    }
+    synthesized_class_overviews(app)
+}
+
+fn synthesized_class_overviews(app: &App) -> Vec<control::ClassOverview> {
+    app.cfg_classes
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let listen = app
+                .listens
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "-".into());
+            let focused = app.class() == name.as_str();
+            let (active_node, generation) = if focused {
+                app.snapshot
+                    .as_ref()
+                    .map(|s| (s.active_node.clone(), s.generation))
+                    .unwrap_or((None, 0))
+            } else {
+                (None, 0)
+            };
+            control::ClassOverview {
+                name: name.clone(),
+                listen,
+                active_node,
+                generation,
+            }
+        })
+        .collect()
+}
+
+/// Pane heights for the four-row dashboard. The node table sizes to its
+/// content; leftover rows go to the events feed so a short pool does not
+/// leave a giant empty table.
+fn dashboard_pane_heights(total: u16, class_count: usize, node_count: usize) -> [u16; 4] {
+    let footer_h = FOOTER_ROWS.min(total);
+    let class_h = (TABLE_CHROME.saturating_add(class_count.max(1) as u16))
+        .min(total.saturating_sub(footer_h));
+    let rest = total.saturating_sub(class_h.saturating_add(footer_h));
+    let events_min = EVENTS_MIN_ROWS.min(rest);
+    let table_budget = rest.saturating_sub(events_min);
+    let node_wanted = TABLE_CHROME
+        .saturating_add(node_count as u16)
+        .max(MIN_NODE_TABLE_ROWS);
+    let table_h = node_wanted
+        .min(table_budget)
+        .max(MIN_NODE_TABLE_ROWS.min(table_budget));
+    let events_h = rest.saturating_sub(table_h);
+    [class_h, table_h, events_h, footer_h]
+}
+
+fn class_strip_column_lengths(total_width: u16) -> [u16; 4] {
+    let budget = total_width.saturating_sub(8).max(40);
+    let class_w = 12u16.min(budget);
+    let gateway_w = 22u16.min(budget.saturating_sub(class_w));
+    let gen_w = 6u16.min(budget.saturating_sub(class_w.saturating_add(gateway_w)));
+    let node_w = budget
+        .saturating_sub(class_w.saturating_add(gateway_w).saturating_add(gen_w))
+        .max(10);
+    [class_w, gateway_w, node_w, gen_w]
 }
 
 fn ui(f: &mut Frame, app: &App) {
@@ -1580,24 +1688,22 @@ fn ui(f: &mut Frame, app: &App) {
         })
         .collect();
 
-    let title = format!(
-        " CAUSEWAY │ class {} │ subscription {} │ gateway {} │ daemon {}{} ",
-        app.class(),
-        app.subscription_label(),
-        app.listen(),
-        if app.connected {
-            "connected"
-        } else {
-            "unreachable"
-        },
-        if app.connected { "" } else { " │ OFFLINE" },
+    let overviews = class_overviews(app);
+    let [class_h, table_h, events_h, footer_h] = dashboard_pane_heights(
+        f.area().height,
+        overviews.len(),
+        app.order.len(),
     );
-    let [table_area, events_area, footer_area] = Layout::vertical([
-        Constraint::Min(6),
-        Constraint::Length(EVENTS_ROWS),
-        Constraint::Length(FOOTER_ROWS),
+    let [class_area, table_area, events_area, footer_area] = Layout::vertical([
+        Constraint::Length(class_h),
+        Constraint::Length(table_h),
+        Constraint::Length(events_h),
+        Constraint::Length(footer_h),
     ])
     .areas(f.area());
+
+    render_class_strip(f, app, class_area, &overviews);
+
     let column_lengths = node_table_column_lengths(table_area.width);
     let widths = column_lengths.map(Constraint::Length);
     let table = Table::new(rows, widths)
@@ -1617,7 +1723,11 @@ fn ui(f: &mut Frame, app: &App) {
             ])
             .style(Style::default().bold()),
         )
-        .block(Block::bordered().title(title))
+        .block(Block::bordered().title(format!(
+            " {} {} · Enter switches this class ",
+            app.class(),
+            app.listen()
+        )))
         .row_highlight_style(Style::new().reversed())
         .highlight_symbol("› ");
 
@@ -1632,6 +1742,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Recent-events feed: the daemon's "what just happened" answer.
     let now = state::now_unix();
+    let ev_capacity = events_area.height.saturating_sub(2) as usize;
     let ev_lines: Vec<Line> = if app.events.is_empty() {
         vec![Line::from(Span::styled(
             "no events yet",
@@ -1642,7 +1753,7 @@ fn ui(f: &mut Frame, app: &App) {
         app.events
             .iter()
             .rev()
-            .take(EVENTS_ROWS as usize)
+            .take(ev_capacity.max(1))
             .map(|e| {
                 let mut line = event_line(now, e);
                 if line.chars().count() > width {
@@ -1658,23 +1769,6 @@ fn ui(f: &mut Frame, app: &App) {
     );
 
     let (message, color) = footer_message(app);
-    let info = Span::styled(
-        format!(
-            "http {} │ socks {} │ generation {}",
-            app.snapshot
-                .as_ref()
-                .and_then(|s| s.http_port)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into()),
-            app.snapshot
-                .as_ref()
-                .and_then(|s| s.socks_port)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into()),
-            generation_label(app.snapshot.as_ref(), app.generation_known),
-        ),
-        Style::default().fg(Color::DarkGray),
-    );
     let traffic = Span::styled(
         format!(
             "conns {} │ total ▲ {} ▼ {} │ rate ▲ {} ▼ {}",
@@ -1688,16 +1782,15 @@ fn ui(f: &mut Frame, app: &App) {
     );
     let help = Span::styled(
         if app.subscription_mutation_allowed() {
-            "k/↑ up │ j/↓ down │ Enter switch │ s subscription │ t test all │ Tab class │ q quit"
+            "Tab/←/→ class │ k/↑ j/↓ node │ Enter switch │ s subscription │ t test all │ q quit"
         } else {
-            "k/↑ up │ j/↓ down │ Enter switch │ s subscriptions (view-only) │ t test all │ Tab class │ q quit"
+            "Tab/←/→ class │ k/↑ j/↓ node │ Enter switch │ s subscriptions (view-only) │ t test all │ q quit"
         },
         Style::default().fg(Color::DarkGray),
     );
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(message, Style::default().fg(color))),
-            Line::from(info),
             Line::from(traffic),
             Line::from(help),
         ]),
@@ -1707,6 +1800,55 @@ fn ui(f: &mut Frame, app: &App) {
     if let Some(picker) = &app.subscription_picker {
         render_subscription_picker(f, app, picker);
     }
+}
+
+fn render_class_strip(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    overviews: &[control::ClassOverview],
+) {
+    let daemon = if app.connected {
+        "connected"
+    } else {
+        "unreachable"
+    };
+    let title = format!(
+        " CAUSEWAY │ subscription {} │ daemon {}{} ",
+        app.subscription_label(),
+        daemon,
+        if app.connected { "" } else { " │ OFFLINE" },
+    );
+    let column_lengths = class_strip_column_lengths(area.width);
+    let widths = column_lengths.map(Constraint::Length);
+    let rows = overviews.iter().map(|class| {
+        let focused = class.name == app.class();
+        let marker = if focused { "› " } else { "  " };
+        let node = class.active_node.as_deref().unwrap_or("<none>");
+        let gen = if class.generation == 0 && class.active_node.is_none() {
+            "-".to_string()
+        } else {
+            class.generation.to_string()
+        };
+        let style = if focused {
+            Style::new().reversed()
+        } else {
+            Style::default()
+        };
+        Row::new(vec![
+            format!("{marker}{}", class.name),
+            class.listen.clone(),
+            node.to_string(),
+            gen,
+        ])
+        .style(style)
+    });
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(["CLASS", "GATEWAY", "NODE", "GEN"]).style(Style::default().bold()),
+        )
+        .block(Block::bordered().title(title));
+    f.render_widget(table, area);
 }
 
 fn render_subscription_picker(f: &mut Frame, app: &App, picker: &SubscriptionPicker) {
@@ -1910,17 +2052,35 @@ async fn print_plain(cfg: &Config, class: &str, client: &Client) -> anyhow::Resu
 }
 
 fn print_snapshot(s: &StatusSnapshot) {
+    if !s.classes.is_empty() {
+        pln!(
+            "{:<12} {:<22} {:<32} {:<6}",
+            "CLASS",
+            "GATEWAY",
+            "NODE",
+            "GEN"
+        );
+        for class in &s.classes {
+            let marker = if class.name == s.class { "› " } else { "  " };
+            pln!(
+                "{:<12} {:<22} {:<32} {:<6}",
+                format!("{marker}{}", class.name),
+                crate::truncate(&class.listen, 22),
+                class
+                    .active_node
+                    .as_deref()
+                    .map(|n| crate::truncate(n, 32))
+                    .unwrap_or_else(|| "<none>".into()),
+                class.generation,
+            );
+        }
+        pln!("");
+    }
     pln!(
-        "class {}: active {}, generation {}, http {}, socks {}",
+        "focused class {}: active {}, generation {}",
         s.class,
         s.active_node.as_deref().unwrap_or("<none>"),
         s.generation,
-        s.http_port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into()),
-        s.socks_port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into()),
     );
     pln!(
         "{:<44} {:>8} {:>10} {:>8} {:>10} {:>10}",
@@ -2002,6 +2162,7 @@ mod tests {
             subscription_txn_in_progress: None,
             available_subscriptions: Vec::new(),
             available_nodes: Vec::new(),
+            classes: Vec::new(),
         }
     }
 
@@ -2196,6 +2357,21 @@ listen = "127.0.0.1:17878"
             ordered_names(Some(&snap), &[], None),
             vec!["lower-rtt", "higher-rtt"],
             "equal success EMA sorts by RTT ascending"
+        );
+    }
+
+    #[test]
+    fn ordered_names_does_not_freeze_on_vanishing_success_ema_lead() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert("jp-slow".into(), stats(0.999999992, Some(284.0), true));
+        nodes.insert("jp-fast".into(), stats(0.999999991, Some(46.0), true));
+        nodes.insert("hk".into(), stats(0.999999991, Some(50.0), true));
+        let snap = snapshot(nodes);
+
+        assert_eq!(
+            ordered_names(Some(&snap), &[], None),
+            vec!["jp-fast", "hk", "jp-slow"],
+            "a 1e-10 success lead must not pin a slow node above faster ones"
         );
     }
 
@@ -2757,6 +2933,75 @@ listen = "127.0.0.1:17878"
             assert!(columns.iter().all(|column| *column > 0));
         }
         assert!(node_table_column_lengths(80)[1] < 20);
+    }
+
+    #[test]
+    fn dashboard_keeps_node_table_to_content_height() {
+        let [class_h, table_h, events_h, footer_h] = dashboard_pane_heights(40, 3, 16);
+        assert_eq!(class_h, 6, "3 chrome + 3 class rows");
+        assert_eq!(table_h, 19, "3 chrome + 16 nodes, not stretched");
+        assert_eq!(footer_h, 3);
+        assert_eq!(class_h + table_h + events_h + footer_h, 40);
+        assert!(events_h >= EVENTS_MIN_ROWS);
+
+        let [_, short_table, leftover_events, _] = dashboard_pane_heights(40, 3, 2);
+        assert_eq!(short_table, MIN_NODE_TABLE_ROWS);
+        assert!(
+            leftover_events > events_h,
+            "leftover rows belong to events, not an empty node table"
+        );
+    }
+
+    #[test]
+    fn class_overviews_prefer_daemon_strip() {
+        let mut app = app_for_order();
+        app.cfg_classes = vec!["browser".into(), "dev".into()];
+        app.listens = vec!["127.0.0.1:17880".into(), "127.0.0.1:17878".into()];
+        app.class_idx = 1;
+        let mut snap = snapshot(BTreeMap::new());
+        snap.class = "dev".into();
+        snap.active_node = Some("hk-dev".into());
+        snap.classes = vec![
+            control::ClassOverview {
+                name: "browser".into(),
+                listen: "127.0.0.1:17880".into(),
+                active_node: Some("jp-browser".into()),
+                generation: 4,
+            },
+            control::ClassOverview {
+                name: "dev".into(),
+                listen: "127.0.0.1:17878".into(),
+                active_node: Some("hk-dev".into()),
+                generation: 9,
+            },
+        ];
+        app.snapshot = Some(snap);
+
+        let overviews = class_overviews(&app);
+        assert_eq!(overviews.len(), 2);
+        assert_eq!(overviews[0].active_node.as_deref(), Some("jp-browser"));
+        assert_eq!(overviews[1].active_node.as_deref(), Some("hk-dev"));
+    }
+
+    #[test]
+    fn class_overviews_synthesize_from_config_when_daemon_omits_strip() {
+        let mut app = app_for_order();
+        app.cfg_classes = vec!["browser".into(), "dev".into()];
+        app.listens = vec!["127.0.0.1:17880".into(), "127.0.0.1:17878".into()];
+        app.class_idx = 1;
+        let mut snap = snapshot(BTreeMap::new());
+        snap.class = "dev".into();
+        snap.active_node = Some("hk-dev".into());
+        snap.generation = 9;
+        app.snapshot = Some(snap);
+
+        let overviews = class_overviews(&app);
+        assert_eq!(overviews[0].name, "browser");
+        assert_eq!(overviews[0].listen, "127.0.0.1:17880");
+        assert_eq!(overviews[0].active_node, None);
+        assert_eq!(overviews[1].name, "dev");
+        assert_eq!(overviews[1].active_node.as_deref(), Some("hk-dev"));
+        assert_eq!(overviews[1].generation, 9);
     }
 
     #[test]

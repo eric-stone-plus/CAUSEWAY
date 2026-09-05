@@ -87,10 +87,11 @@ loginctl enable-linger "$USER"     # optional: run while logged out
 ```
 
 CLI: `causeway run | probe | status | config check | switch`; bare
-`causeway` opens the dashboard TUI — quality-ranked node table with per-node
-traffic columns, events feed, `s` subscription picker, `t` end-to-end test of
-all nodes, and Tab to cycle classes (plain table when piped) — see `--help`
-for details. Logs:
+`causeway` opens the dashboard TUI — an always-visible class strip (every
+listener and its active node), a quality-ranked node table for the focused
+class with per-node traffic columns, events feed, `s` subscription picker,
+`t` end-to-end test of all nodes, and Tab to cycle classes so Enter switches
+only that class (plain table when piped) — see `--help` for details. Logs:
 `journalctl --user -u causeway -f`.
 
 ### Site freeze awareness (anti-bot)
