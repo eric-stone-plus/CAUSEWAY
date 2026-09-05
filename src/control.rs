@@ -307,6 +307,24 @@ pub struct StatusSnapshot {
     /// Nodes in the active subscription pool, including nodes without stats.
     #[serde(default)]
     pub available_nodes: Vec<String>,
+    /// Every configured class and its current gateway binding. Empty means
+    /// an older daemon omitted the strip; the TUI then synthesizes from
+    /// local config plus this snapshot's focused class.
+    #[serde(default)]
+    pub classes: Vec<ClassOverview>,
+}
+
+/// One configured traffic class as shown in the dashboard strip.
+///
+/// Listen addresses are the client-facing gateways; adapter-local HTTP/SOCKS
+/// ports stay off this summary so the operator sees the same endpoints the
+/// clients use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassOverview {
+    pub name: String,
+    pub listen: String,
+    pub active_node: Option<String>,
+    pub generation: u64,
 }
 
 /// Cumulative byte counts for one node.
@@ -874,6 +892,12 @@ mod tests {
                 },
             ],
             available_nodes: vec!["hk01".into()],
+            classes: vec![ClassOverview {
+                name: "dev".into(),
+                listen: "127.0.0.1:17878".into(),
+                active_node: Some("hk01".into()),
+                generation: 3,
+            }],
         };
         let status = roundtrip(&Reply::ok_status(snap)).status.unwrap();
         assert_eq!(status.active_subscription.as_deref(), Some("primary"));
@@ -881,6 +905,8 @@ mod tests {
         assert_eq!(status.subscription_txn_in_progress, Some(false));
         assert_eq!(status.available_subscriptions.len(), 2);
         assert_eq!(status.available_nodes, ["hk01"]);
+        assert_eq!(status.classes.len(), 1);
+        assert_eq!(status.classes[0].listen, "127.0.0.1:17878");
 
         let probed = vec![ProbeResult {
             node: "hk01".into(),
@@ -953,6 +979,7 @@ mod tests {
         assert_eq!(snap.subscription_txn_in_progress, None);
         assert!(snap.available_subscriptions.is_empty());
         assert!(snap.available_nodes.is_empty());
+        assert!(snap.classes.is_empty());
     }
 
     #[test]

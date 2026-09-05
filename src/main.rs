@@ -427,28 +427,23 @@ fn cmd_status(cfg: &config::Config) -> anyhow::Result<()> {
         pln!("\nclasses: <none recorded>");
     } else {
         pln!(
-            "\n{:<12} {:<40} {:<10} {:<8} {:<6}",
+            "\n{:<12} {:<22} {:<32} {:<6}",
             "CLASS",
-            "ACTIVE NODE",
-            "SOCKS",
-            "HTTP",
+            "GATEWAY",
+            "NODE",
             "GEN"
         );
-        for (name, cs) in &st.classes {
+        for (name, class) in &cfg.classes {
+            let cs = st.classes.get(name);
             pln!(
-                "{:<12} {:<40} {:<10} {:<8} {:<6}",
+                "{:<12} {:<22} {:<32} {:<6}",
                 name,
-                cs.active_node
-                    .as_deref()
-                    .map(|n| truncate(n, 40))
+                class.listen.to_string(),
+                cs.and_then(|c| c.active_node.as_deref())
+                    .map(|n| truncate(n, 32))
                     .unwrap_or_else(|| "<none>".into()),
-                cs.socks_port
-                    .map(|p| p.to_string())
+                cs.map(|c| c.generation.to_string())
                     .unwrap_or_else(|| "-".into()),
-                cs.http_port
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                cs.generation,
             );
         }
     }

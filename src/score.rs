@@ -33,6 +33,24 @@ pub struct NodeStats {
 /// How many recent RTT samples per node survive in the state file.
 pub const RTT_HISTORY: usize = 20;
 
+/// Absolute success-EMA gap treated as a tie so RTT can decide.
+///
+/// After a long run of identical successes the EMA never quite reaches 1.0,
+/// and a 1e-10 lead from probe order is preserved by every later success
+/// (`new = α + (1-α)·old`). The dashboard prints success to three decimals,
+/// so a gap below one display tick is ranking noise. Automatic switching
+/// still uses [`challenger_wins`] hysteresis and is not affected.
+pub const SUCCESS_TIE_EPS: f64 = 1e-4;
+
+/// Compare success EMAs, collapsing sub-display-tick gaps to equality.
+pub fn success_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    if (a - b).abs() <= SUCCESS_TIE_EPS {
+        std::cmp::Ordering::Equal
+    } else {
+        a.total_cmp(&b)
+    }
+}
+
 impl Default for NodeStats {
     fn default() -> Self {
         Self {
@@ -81,7 +99,7 @@ impl NodeStats {
 /// comparison — a standalone compare function reads more clearly.
 pub fn score_cmp(a: &NodeStats, b: &NodeStats) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    match a.success_ema.total_cmp(&b.success_ema) {
+    match success_cmp(a.success_ema, b.success_ema) {
         Ordering::Equal => {}
         ord => return ord,
     }
@@ -191,6 +209,25 @@ mod tests {
             score_cmp(&c, &a),
             std::cmp::Ordering::Greater,
             "equal success rate compares RTT"
+        );
+    }
+
+    #[test]
+    fn score_cmp_ignores_vanishing_success_lead() {
+        // Live nodes that have only ever succeeded sit at 0.99999999… with a
+        // frozen 1e-10 gap; that must not pin a 280ms node above a 46ms one.
+        let frozen_slow = stats(0.999999992, Some(280.0));
+        let faster = stats(0.999999991, Some(46.0));
+        assert_eq!(
+            score_cmp(&faster, &frozen_slow),
+            std::cmp::Ordering::Greater,
+            "sub-tick success gap yields to RTT"
+        );
+        let actually_worse = stats(0.90, Some(10.0));
+        assert_eq!(
+            score_cmp(&faster, &actually_worse),
+            std::cmp::Ordering::Greater,
+            "a real success gap still outranks RTT"
         );
     }
 

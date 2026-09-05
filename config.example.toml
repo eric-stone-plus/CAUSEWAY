@@ -62,6 +62,11 @@ cache_file = "~/.local/share/causeway/subscriptions/remote-backup.yaml"
 # Traffic classes → loopback listen addresses. Clients pick a listener by
 # purpose; the Rust listener only classifies HTTP/SOCKS5 by first byte. The
 # static exact-host rules above are compiled into the supervised adapters.
+# The dashboard shows every class at once; Enter switches only the focused
+# class so a scrape rotation cannot move interactive traffic.
+[classes.browser]
+listen = "127.0.0.1:17880"      # interactive browser traffic
+
 [classes.dev]
 listen = "127.0.0.1:17878"      # development traffic
 

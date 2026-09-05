@@ -410,12 +410,19 @@ impl Config {
         if self.classes.is_empty() {
             bail!("at least one [classes.<name>] section is required in the config");
         }
+        let mut seen_listens = BTreeMap::new();
         for (name, class) in &self.classes {
             if !class.listen.ip().is_loopback() {
                 // Design red line: listen on loopback only, never expose an
                 // entry point to the outside
                 bail!(
                     "listen address {} of class {name:?} is not a loopback address",
+                    class.listen
+                );
+            }
+            if let Some(other) = seen_listens.insert(class.listen, name.clone()) {
+                bail!(
+                    "classes {other:?} and {name:?} share listen address {}",
                     class.listen
                 );
             }
@@ -1232,6 +1239,23 @@ listen = "0.0.0.0:17878"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_class_listen_rejected() {
+        let text = r#"
+[subscriptions]
+files = ["/tmp/x.yaml"]
+[classes.dev]
+listen = "127.0.0.1:17878"
+[classes.browser]
+listen = "127.0.0.1:17878"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("share listen address"), "{error}");
+        assert!(error.contains("dev"), "{error}");
+        assert!(error.contains("browser"), "{error}");
     }
 
     #[test]
