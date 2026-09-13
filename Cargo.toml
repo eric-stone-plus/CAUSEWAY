@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Supervised local egress gateway with health-scored, zero-downtime upstream failover (userspace TCP only)"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "causeway"

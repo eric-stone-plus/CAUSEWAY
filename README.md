@@ -143,4 +143,4 @@ config.example.toml  configuration reference; every field documented
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+GPL-3.0-or-later. See `LICENSE`.
