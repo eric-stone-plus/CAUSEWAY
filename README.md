@@ -143,4 +143,4 @@ config.example.toml  configuration reference; every field documented
 
 ## License
 
-GPL-3.0-or-later. See `LICENSE`.
+MIT. See `LICENSE`.
