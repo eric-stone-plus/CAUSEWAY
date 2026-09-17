@@ -677,42 +677,71 @@ fn fetch_remote_manifest_with(
     // listings. Proxy variables are removed and `--noproxy *` is explicit:
     // fetching a replacement subscription through the currently broken
     // subscription would make recovery circular.
-    let child = Command::new(curl_bin)
-        .arg("--disable")
-        .arg("--config")
-        .arg("-")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--fail")
-        .arg("--location")
-        .arg("--globoff")
-        .arg("--proto")
-        .arg("=https")
-        .arg("--proto-redir")
-        .arg("=https")
-        .arg("--connect-timeout")
-        .arg("15")
-        .arg("--max-time")
-        .arg("60")
-        .arg("--noproxy")
-        .arg("*")
-        .arg("--proxy")
-        .arg("")
-        .env_remove("http_proxy")
-        .env_remove("https_proxy")
-        .env_remove("all_proxy")
-        .env_remove("no_proxy")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("ALL_PROXY")
-        .env_remove("NO_PROXY")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // curl may echo a hostname or URL in diagnostics. The public error is
-        // status-only, so provider credentials cannot reach logs or events.
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(SubscriptionError::FetchStart)?;
+    //
+    // ETXTBSY retry: exec'ing a just-restaged fetcher can transiently lose a
+    // race with the write side (observed as a ~1-in-8 suite flake under
+    // parallel test load, os error 26). Transient by definition — retry a
+    // handful of times with a short backoff before failing.
+    let mut child = None;
+    let mut last_err = None;
+    for attempt in 0..5 {
+        {
+            match Command::new(curl_bin)
+                .arg("--disable")
+                .arg("--config")
+                .arg("-")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--fail")
+                .arg("--location")
+                .arg("--globoff")
+                .arg("--proto")
+                .arg("=https")
+                .arg("--proto-redir")
+                .arg("=https")
+                .arg("--connect-timeout")
+                .arg("15")
+                .arg("--max-time")
+                .arg("60")
+                .arg("--noproxy")
+                .arg("*")
+                .arg("--proxy")
+                .arg("")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .env_remove("no_proxy")
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("NO_PROXY")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                // curl may echo a hostname or URL in diagnostics. The public error is
+                // status-only, so provider credentials cannot reach logs or events.
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => {
+                    last_err = Some(SubscriptionError::FetchStart(e));
+                    break;
+                }
+            }
+        }
+    }
+    let child = match child {
+        Some(c) => c,
+        None => {
+            return Err(last_err.expect("spawn loop always sets an error on failure"));
+        }
+    };
 
     // The UA rides in the stdin config alongside the URL so argv stays free
     // of any provider-facing detail.
