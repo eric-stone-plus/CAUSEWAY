@@ -144,3 +144,8 @@ config.example.toml  configuration reference; every field documented
 ## License
 
 MIT. See `LICENSE`.
+
+## CI
+
+`ci.yml` runs `cargo test --locked` on every push and PR.
+`release.yml` remains manual-only (workflow_dispatch).
