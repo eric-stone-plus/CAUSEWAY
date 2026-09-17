@@ -2953,10 +2953,12 @@ listen = "127.0.0.1:17878"
         switch_node_inner(&ctx, &class, "health-failures").await;
 
         assert_eq!(trace.starts(), ["alternate", "current"]);
-        assert_eq!(
-            trace.stops(),
-            ["candidate-0-alternate", "candidate-1-current"]
-        );
+        // The two failed candidates stop from concurrent tasks, so their stop
+        // ORDER is scheduler-dependent (flaked ~1-in-3 suite runs under
+        // parallel load). The contract is "both stopped", not their sequence.
+        let mut stops = trace.stops().to_vec();
+        stops.sort_unstable();
+        assert_eq!(stops, ["candidate-0-alternate", "candidate-1-current"]);
         let rt = class.lock().await;
         assert_eq!(
             rt.active.as_ref().unwrap().handle.describe(),
