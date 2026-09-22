@@ -109,6 +109,13 @@ pub struct ClassConfig {
     /// (old paths keep serving; fix or drop the override to refresh).
     #[serde(default)]
     pub selection: Option<ClassSelection>,
+    /// Per-class override of the global [health] check target. The class's
+    /// health loop, candidate pre-checks, and on-demand end-to-end probes all
+    /// use the effective target: a class whose traffic needs a specific
+    /// destination to actually work (e.g. a messaging API) must not be judged
+    /// healthy by an unrelated generate_204 endpoint.
+    #[serde(default)]
+    pub health: Option<ClassHealth>,
 }
 
 /// Keys of [selection] that a single class may override. Both are optional:
@@ -126,6 +133,22 @@ pub struct ClassSelection {
     /// challenger-wins only log).
     #[serde(default)]
     pub auto_switch: Option<bool>,
+}
+
+/// Keys of [health] that a single class may override. The target is either a
+/// plaintext `http://` URL (GET, 2xx = healthy) or a `connect://host[:port]`
+/// authority (CONNECT-tunnel reachability, 2xx = healthy) for services whose
+/// plaintext HTTP semantics would never read 2xx. Two caveats: a 2xx CONNECT
+/// proves the egress accepted the tunnel, not that the origin answered; and
+/// verdicts judged by this class's target deliberately never write the
+/// shared per-node scores (they describe one destination, not the node's
+/// generic fitness) — the class's automatic ranking keeps using the generic
+/// scores. The class-local failure streak driving recovery is per-session
+/// (in-memory), like the recovery backoff.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct ClassHealth {
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// Static destination routing compiled into each supervised data plane.
@@ -444,6 +467,27 @@ impl Config {
             .unwrap_or(self.selection.auto_switch)
     }
 
+    /// The per-class health target override, if this class carries one.
+    /// Single derivation point: target selection AND the shared-score
+    /// recording rule both ask this, so they cannot drift apart.
+    pub fn class_health_override(&self, class: &str) -> Option<&str> {
+        self.classes
+            .get(class)
+            .and_then(|c| c.health.as_ref())
+            .and_then(|h| h.url.as_deref())
+    }
+
+    /// Effective health-check target for `class`: the per-class override
+    /// when set, else the global [health].url. Every automatic-selection
+    /// path for the class (health loop, candidate pre-check, on-demand
+    /// end-to-end probe) must consult this, not the raw global value.
+    /// Note: `connect://` targets reject bracketed IPv6 literals while the
+    /// `http://` form accepts them — hostname-shaped targets only, and the
+    /// asymmetry fails closed at validation.
+    pub fn class_health_url(&self, class: &str) -> &str {
+        self.class_health_override(class).unwrap_or(&self.health.url)
+    }
+
     /// Compact per-class policy summary for the dashboard strip, e.g.
     /// "regions=hk,jp auto=off". Empty = inherits global [selection].
     pub fn class_selection_summary(&self, class: &str) -> String {
@@ -493,6 +537,20 @@ impl Config {
                     bail!(
                         "classes.{name}.selection.regions is empty — omit the key to inherit [selection].regions"
                     );
+                }
+            }
+            if let Some(health) = &class.health {
+                if let Some(url) = &health.url {
+                    if url.is_empty() {
+                        bail!(
+                            "classes.{name}.health.url is empty — omit the key to inherit [health].url"
+                        );
+                    }
+                    if !crate::health::valid_target(url) {
+                        bail!(
+                            "classes.{name}.health.url must be a plaintext http:// URL or a connect://host[:port] target, without credentials, fragments, whitespace, or control characters"
+                        );
+                    }
                 }
             }
         }
@@ -1274,6 +1332,74 @@ auto_switch = false
         // Unknown class inherits global policy rather than failing.
         assert_eq!(cfg.class_regions("nope"), &["Japan".to_string()]);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn class_health_url_overrides_and_inherits() {
+        let text = r#"
+[subscriptions]
+files = ["~/sub.yaml"]
+
+[health]
+url = "http://www.gstatic.com/generate_204"
+
+[classes.dev]
+listen = "127.0.0.1:17878"
+
+[classes.telegram]
+listen = "127.0.0.1:17885"
+
+[classes.telegram.health]
+url = "connect://api.example:443"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            cfg.class_health_url("dev"),
+            "http://www.gstatic.com/generate_204",
+            "unset override inherits the global target"
+        );
+        assert_eq!(
+            cfg.class_health_url("telegram"),
+            "connect://api.example:443"
+        );
+        // Unknown class inherits global policy rather than failing.
+        assert_eq!(
+            cfg.class_health_url("nope"),
+            "http://www.gstatic.com/generate_204"
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn class_health_url_rejects_invalid_targets() {
+        for bad in [
+            "https://api.example/",        // TLS not handled by the checker
+            "connect://api.example:99999", // port out of range
+            "connect://api.example/path",  // authority only
+            "ftp://api.example/",
+            "connect://",                  // empty authority
+            "",                            // empty string: inherit instead
+            "connect://host:443:443",      // stray colons
+        ] {
+            let text = format!(
+                r#"
+[subscriptions]
+files = ["~/sub.yaml"]
+
+[classes.dev]
+listen = "127.0.0.1:17878"
+
+[classes.dev.health]
+url = "{bad}"
+"#
+            );
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("dev.health.url"),
+                "target {bad:?} must be rejected with the offending key: {error}"
+            );
+        }
     }
 
     #[test]

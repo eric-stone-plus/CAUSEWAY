@@ -106,6 +106,14 @@ struct ClassRuntime {
     route: SharedRoute,
     active: Option<ActiveNode>,
     auto_recovery: AutoRecoveryBackoff,
+    /// Class-local consecutive health failures that drive the recovery
+    /// threshold. Deliberately NOT the shared per-node
+    /// NodeStats.consecutive_health_failures: with per-class health targets,
+    /// two classes sharing a node can hold divergent verdicts, and a shared
+    /// decision counter would be reset by the other class's ok before ever
+    /// reaching the threshold. The NodeStats counter stays as the display
+    /// value (TUI HLTH-F column).
+    health_failures: u32,
 }
 
 /// The active profile name and its pool must always be published together.
@@ -458,17 +466,20 @@ fn profile_candidates(
 
 /// Start and pre-check one candidate path; cleans up after itself on failure
 /// (stops the data plane).
-async fn try_activate(ctx: &Ctx, node: &Node) -> anyhow::Result<ActiveNode> {
+async fn try_activate(ctx: &Ctx, class_name: &str, node: &Node) -> anyhow::Result<ActiveNode> {
     let spec = StartSpec::reserve(node.clone())?;
     let socks_port = spec.socks_addr().port();
     let http_port = spec.http_addr().port();
     let mut handle = ctx.plane.start(spec).await?;
 
-    // Check before switch: probe straight through the new data plane's http
-    // port (bypassing the listener, isolating variables)
-    match health::http_get_status(
+    // Check before switch, straight through the new data plane's http port
+    // (bypassing the listener, isolating variables) and against the class's
+    // effective target: a class pinned to a specific destination must
+    // pre-check that destination, not an unrelated generate_204 that can
+    // stay green while the real traffic is blackholed.
+    match health::check_status(
         handle.http_addr(),
-        &ctx.cfg.health.url,
+        ctx.cfg.class_health_url(class_name),
         std::time::Duration::from_millis(ctx.cfg.health.timeout_ms),
     )
     .await
@@ -535,6 +546,7 @@ async fn install_active(ctx: &Ctx, rt: &mut ClassRuntime, new_active: ActiveNode
         }
         st.updated_unix = state::now_unix();
     }
+    rt.health_failures = 0;
     save_state(ctx);
 
     ctx.events.push(control::Event::Switched {
@@ -572,7 +584,7 @@ async fn try_candidates(
     reason: &str,
 ) -> Option<String> {
     for cand in candidates {
-        match try_activate(ctx, cand).await {
+        match try_activate(ctx, &rt.name, cand).await {
             Ok(active) => {
                 let name = active.node.name().to_string();
                 install_active(ctx, rt, active, reason).await;
@@ -580,7 +592,10 @@ async fn try_candidates(
             }
             Err(e) => {
                 warn!(class = %rt.name, node = %cand.name(), error = %format!("{e:#}"), "candidate activation failed, trying next");
-                {
+                // Same shared-EMA rule as the probe path: a pre-check
+                // verdict against a class-specific target says nothing about
+                // the node's generic fitness.
+                if ctx.cfg.class_health_override(&rt.name).is_none() {
                     let mut st = lock_state(&ctx.state);
                     st.nodes
                         .entry(cand.name().to_string())
@@ -1007,7 +1022,7 @@ async fn switch_subscription_locked(
         );
         let mut activated = None;
         for candidate in candidates.into_iter().take(MAX_SWITCH_CANDIDATES) {
-            match tokio::time::timeout_at(deadline, try_activate(ctx, &candidate)).await {
+            match tokio::time::timeout_at(deadline, try_activate(ctx, &class_name, &candidate)).await {
                 Err(_) => {
                     stop_staged(&mut staged).await;
                     return subscription_failure(
@@ -1170,6 +1185,9 @@ async fn switch_subscription_locked(
             let path_connections = Arc::clone(&new_active.path_connections);
             old.push(rt.active.replace(new_active));
             rt.auto_recovery.reset();
+            // Fresh path, fresh streak — same reset install_active performs
+            // on every other publication path.
+            rt.health_failures = 0;
             route.socks_upstream = Some(*socks);
             route.http_upstream = Some(*http);
             route.node_name = node_name.clone();
@@ -1355,7 +1373,7 @@ async fn handle_control(
             if !classes.contains_key(&class) {
                 return control::Reply::err(format!("unknown class {class:?}"));
             }
-            let results = probe_now(&ctx).await;
+            let results = probe_now(&ctx, &class).await;
             let ok = results.iter().filter(|r| r.ok).count();
             ctx.events.push(control::Event::Probed {
                 unix: state::now_unix(),
@@ -1638,8 +1656,18 @@ async fn switch_for_site(
 /// Bounded concurrency — every probe spawns a whole data-plane process.
 const PROBE_NOW_CONCURRENCY: usize = 8;
 
-async fn probe_now_inner(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
+async fn probe_now_inner(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResult> {
     let nodes = pool(ctx);
+    // Every pool node is tested, but through the REQUESTING class's
+    // effective health target: an on-demand probe must answer the operator's
+    // actual question ("would this class's traffic work on these nodes?"),
+    // not a generic reachability one.
+    let health_url = ctx.cfg.class_health_url(class).to_string();
+    // Verdicts judged against a class-specific target must not write the
+    // shared per-node scores: they describe one destination, not the node's
+    // generic fitness every other class ranks by. A demotion here would
+    // steer unrelated classes' automatic selection.
+    let record = ctx.cfg.class_health_override(class).is_none();
     let total = nodes.len();
     let era = ctx
         .subscriptions
@@ -1651,9 +1679,10 @@ async fn probe_now_inner(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
     for node in nodes {
         let ctx = Arc::clone(ctx);
         let sem = Arc::clone(&sem);
+        let health_url = health_url.clone();
         set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
-            probe_now_node(&ctx, node, era).await
+            probe_now_node(&ctx, node, era, &health_url, record).await
         });
     }
     let mut out = Vec::with_capacity(total);
@@ -1666,8 +1695,8 @@ async fn probe_now_inner(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
     out
 }
 
-async fn probe_now(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
-    let results = probe_now_inner(ctx).await;
+async fn probe_now(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResult> {
+    let results = probe_now_inner(ctx, class).await;
     save_state(ctx);
     results
 }
@@ -1679,7 +1708,13 @@ async fn probe_now(ctx: &Arc<Ctx>) -> Vec<control::ProbeResult> {
 /// checks behind it. The pool era is revalidated under the gate so results
 /// from a snapshot taken before a publication can never land in the new
 /// profile's statistics — the same boundary the whole-run gate used to draw.
-async fn probe_now_node(ctx: &Arc<Ctx>, node: Node, era: u64) -> control::ProbeResult {
+async fn probe_now_node(
+    ctx: &Arc<Ctx>,
+    node: Node,
+    era: u64,
+    health_url: &str,
+    record: bool,
+) -> control::ProbeResult {
     let _reconfiguration = ctx.reconfiguration.read().await;
     let still_current = ctx
         .subscriptions
@@ -1696,11 +1731,17 @@ async fn probe_now_node(ctx: &Arc<Ctx>, node: Node, era: u64) -> control::ProbeR
             error: Some("skipped: subscription changed".to_string()),
         };
     }
-    test_node(ctx, &node).await
+    test_node(ctx, health_url, &node, record).await
 }
 
-/// One node's end-to-end test: start → readiness → generate_204 → stop.
-async fn test_node(ctx: &Ctx, node: &Node) -> control::ProbeResult {
+/// One node's end-to-end test against the given health target:
+/// start → readiness → check → stop.
+async fn test_node(
+    ctx: &Ctx,
+    health_url: &str,
+    node: &Node,
+    record: bool,
+) -> control::ProbeResult {
     let fail = |http_status: Option<u16>, error: Option<String>| control::ProbeResult {
         node: node.name().to_string(),
         ok: false,
@@ -1715,13 +1756,15 @@ async fn test_node(ctx: &Ctx, node: &Node) -> control::ProbeResult {
     let mut handle = match ctx.plane.start(spec).await {
         Ok(h) => h,
         Err(e) => {
-            record_probe_result(ctx, node, None);
+            if record {
+                record_probe_result(ctx, node, None);
+            }
             return fail(None, Some(format!("{e:#}")));
         }
     };
-    let res = health::http_get_status_timed(
+    let res = health::check_status_timed(
         handle.http_addr(),
-        &ctx.cfg.health.url,
+        health_url,
         std::time::Duration::from_millis(ctx.cfg.health.timeout_ms),
     )
     .await;
@@ -1730,7 +1773,9 @@ async fn test_node(ctx: &Ctx, node: &Node) -> control::ProbeResult {
     }
     match res {
         Ok((code, rtt)) if (200..300).contains(&code) => {
-            record_probe_result(ctx, node, Some(rtt));
+            if record {
+                record_probe_result(ctx, node, Some(rtt));
+            }
             control::ProbeResult {
                 node: node.name().to_string(),
                 ok: true,
@@ -1740,7 +1785,9 @@ async fn test_node(ctx: &Ctx, node: &Node) -> control::ProbeResult {
             }
         }
         Ok((code, _)) => {
-            record_probe_result(ctx, node, None);
+            if record {
+                record_probe_result(ctx, node, None);
+            }
             fail(Some(code), None)
         }
         Err(e) => {
@@ -1868,7 +1915,7 @@ async fn activate_initial(ctx: &Arc<Ctx>, class: &Arc<tokio::sync::Mutex<ClassRu
     };
 
     for cand in candidates {
-        match try_activate(ctx, &cand).await {
+        match try_activate(ctx, &rt.name, &cand).await {
             Ok(active) => {
                 install_active(ctx, &mut rt, active, "initial").await;
                 return;
@@ -1915,6 +1962,44 @@ async fn probe_cycle(ctx: &Ctx, source: &str) {
     probe_cycle_inner(ctx, source).await;
 }
 
+/// One health-cycle bookkeeping. The display counter on the shared node
+/// stats keeps its historical meaning (TUI HLTH-F column), but the
+/// threshold decision is the class-local streak: with per-class health
+/// targets, another class sharing this node can hold the opposite verdict,
+/// and a shared decision counter would be reset by its ok before ever
+/// reaching the threshold. Returns (class-local streak, has_active).
+fn record_health_outcome(ctx: &Ctx, rt: &mut ClassRuntime, ok: bool) -> (u32, bool) {
+    let active_name = rt.active.as_ref().map(|a| a.node.name().to_string());
+    match active_name {
+        Some(n) => {
+            let mut st = lock_state(&ctx.state);
+            let stats = st.nodes.entry(n.clone()).or_default();
+            if ok {
+                stats.consecutive_health_failures = 0;
+            } else {
+                stats.consecutive_health_failures += 1;
+            }
+            rt.health_failures = if ok {
+                0
+            } else {
+                rt.health_failures.saturating_add(1)
+            };
+            let consecutive = rt.health_failures;
+            if !ok && consecutive > 0 {
+                ctx.events.push(control::Event::HealthFailed {
+                    unix: state::now_unix(),
+                    class: rt.name.clone(),
+                    node: n,
+                    consecutive,
+                });
+            }
+            (consecutive, true)
+        }
+        // No active path → the caller tries to establish one immediately.
+        None => (ctx.cfg.health.fail_threshold, false),
+    }
+}
+
 /// Health-check loop (one per class): full-path check through our own
 /// listener.
 async fn health_loop(
@@ -1936,32 +2021,10 @@ async fn health_loop(
         }
 
         let _reconfiguration = ctx.reconfiguration.read().await;
-        let ok = health::is_healthy(listen_addr, &ctx.cfg.health.url, timeout).await;
+        let ok = health::is_healthy(listen_addr, ctx.cfg.class_health_url(&name), timeout).await;
         let (failures, has_active) = {
-            let rt = class.lock().await;
-            let active_name = rt.active.as_ref().map(|a| a.node.name().to_string());
-            match &active_name {
-                Some(n) => {
-                    let mut st = lock_state(&ctx.state);
-                    let stats = st.nodes.entry(n.clone()).or_default();
-                    if ok {
-                        stats.consecutive_health_failures = 0;
-                    } else {
-                        stats.consecutive_health_failures += 1;
-                    }
-                    let consecutive = stats.consecutive_health_failures;
-                    if !ok && consecutive > 0 {
-                        ctx.events.push(control::Event::HealthFailed {
-                            unix: state::now_unix(),
-                            class: name.clone(),
-                            node: n.clone(),
-                            consecutive,
-                        });
-                    }
-                    (consecutive, true)
-                }
-                None => (ctx.cfg.health.fail_threshold, false), // no active path → try to establish one immediately
-            }
+            let mut rt = class.lock().await;
+            record_health_outcome(&ctx, &mut rt, ok)
         };
 
         if !ok {
@@ -2098,7 +2161,7 @@ async fn rebuild_current_after_egress_change_with<F, Fut>(
     let activation = tokio::select! {
         biased;
         _ = shutdown.changed() => return,
-        result = try_activate(ctx, &node) => result,
+        result = try_activate(ctx, &rt.name, &node) => result,
     };
     let mut replacement = match activation {
         Ok(active) => active,
@@ -2318,6 +2381,7 @@ pub async fn run(cfg: Config, config_path: PathBuf) -> anyhow::Result<()> {
             route: Arc::clone(&route),
             active: None,
             auto_recovery: AutoRecoveryBackoff::default(),
+            health_failures: 0,
         }));
         listener_tasks.push(tokio::spawn(listener::serve(
             name.clone(),
