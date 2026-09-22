@@ -1574,6 +1574,50 @@ async fn initial_activation_respects_region_allowlist() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+#[tokio::test]
+async fn initial_activation_respects_per_class_region_override() {
+    // Global [selection].regions stays EMPTY (would admit any node), but the
+    // class carries [classes.<name>.selection] with a Hong Kong-only
+    // allowlist: the class-scoped override must skip the out-of-allowlist
+    // incumbent even though global policy would have admitted it.
+    let (ctx, class, trace, dir) = recovery_fixture(
+        vec![node("current"), node("🇭🇰 Hong Kong丨01")],
+        [("🇭🇰 Hong Kong丨01", 204)],
+        1,
+        0,
+        "initial-class-regions",
+    );
+    let mut ctx = ctx;
+    Arc::get_mut(&mut ctx).unwrap()
+        .cfg
+        .classes
+        .get_mut("dev")
+        .unwrap()
+        .selection = Some(crate::config::ClassSelection {
+        regions: Some(vec!["🇭🇰".to_string()]),
+        auto_switch: None,
+    });
+    {
+        let mut rt = class.lock().await;
+        rt.active = None;
+    }
+    activate_initial(&ctx, &class).await;
+    assert_eq!(
+        trace.starts(),
+        vec!["🇭🇰 Hong Kong丨01".to_string()],
+        "initial activation must not try the node outside the class allowlist"
+    );
+    let installed = class
+        .lock()
+        .await
+        .active
+        .as_ref()
+        .map(|a| a.node.name().to_string());
+    assert_eq!(installed.as_deref(), Some("🇭🇰 Hong Kong丨01"));
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn ranked_candidates_region_filter_restricts_automatic_pool() {
     let dir = test_dir("regions");
@@ -1644,6 +1688,43 @@ async fn pinned_mode_without_active_node_still_activates() {
         !trace.starts().is_empty(),
         "establishing a path with no active node is activation, not switching"
     );
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn per_class_pinned_override_holds_while_global_policy_stays_automatic() {
+    // Mirror of pinned_mode_health_failure_stays_on_active_node with the
+    // pin moved from the global flag to [classes.dev.selection]: the global
+    // policy stays automatic, so only the per-class override can explain a
+    // stay-put outcome.
+    let (ctx, class, trace, dir) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [("alternate", 204), ("current", 503)],
+        2,
+        0,
+        "health-class-pinned",
+    );
+    let mut ctx = ctx;
+    Arc::get_mut(&mut ctx).unwrap()
+        .cfg
+        .classes
+        .get_mut("dev")
+        .unwrap()
+        .selection = Some(crate::config::ClassSelection {
+        regions: None,
+        auto_switch: Some(false),
+    });
+    recover_after_health_failure(&ctx, &class).await;
+    assert_eq!(
+        trace.starts(),
+        Vec::<String>::new(),
+        "the per-class pin must hold even though global policy is automatic"
+    );
+    // Manual switching stays available and unrestricted by the override.
+    let outcome = switch_to(&ctx, &class, "alternate").await.unwrap();
+    assert_eq!(outcome.installed, "alternate");
+    assert_eq!(trace.starts(), vec!["alternate"]);
     stop_draining(&ctx).await;
     std::fs::remove_dir_all(dir).ok();
 }

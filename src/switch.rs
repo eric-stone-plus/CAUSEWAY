@@ -8,9 +8,22 @@
 //! the normal check-before-switch flow with reason "manual"), `t` to run
 //! an end-to-end latency test of every node, `s` to switch subscription
 //! profiles (`e` inside the picker replaces a remote profile's credential
-//! URL via masked input — atomically written 0600, never rendered), q to
-//! quit. When stdout is not a terminal, prints a plain status
-//! report instead — safe in scripts and pipelines.
+//! URL via masked input — atomically written 0600, never rendered), `/` to
+//! filter the node table, `c` to surface paste-ready proxy exports for the
+//! focused class, `?` for the key table (derived from the same single
+//! BINDINGS source as the footer hint, so they cannot drift), q to quit.
+//!
+//! Refresh spine: every daemon request — cadence refreshes and mutations
+//! alike — runs on a background task whose reply is polled each tick, so a
+//! slow or wedged daemon never freezes the interface. Each lane (status,
+//! events, mutation) holds at most one request in flight, and superseded
+//! replies (class changed, mutation landed in between) are discarded by an
+//! epoch check instead of painting stale state. Data age is honest: the
+//! strip title and footer stamp how old the last live snapshot is and turn
+//! STALE past the refresh cadence (3× yellow, 10× red).
+//!
+//! When stdout is not a terminal, prints a plain status report instead —
+//! safe in scripts and pipelines.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -25,6 +38,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
+use tokio::sync::oneshot;
 
 use crate::config::Config;
 use crate::control::{self, Client, Request, StatusSnapshot};
@@ -46,6 +60,17 @@ const SUBSCRIPTION_SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Poll the daemon for fresh data this often while idle
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
+/// Input poll per draw-loop turn. Reply application happens on the next
+/// turn after this window at the latest, so a TUI feels live without
+/// redrawing hot.
+const POLL_EVERY: Duration = Duration::from_millis(100);
+/// A live snapshot older than 3 refresh intervals is suspect (yellow);
+/// past 10 it is red and flagged STALE. "Fake-alive is worse than dead":
+/// a slow daemon must be visible as slow, not painted as fresh.
+const STALE_AFTER: u32 = 3;
+const VERY_STALE_AFTER: u32 = 10;
+/// Node-table filter input cap (chars); enough for any node-name fragment.
+const FILTER_MAX_CHARS: usize = 64;
 /// Event feed minimum height (rows, including the bordered block).
 /// Leftover terminal rows go here instead of stretching the node table.
 const EVENTS_MIN_ROWS: u16 = 4;
@@ -56,6 +81,156 @@ const FOOTER_ROWS: u16 = 3;
 const TABLE_CHROME: u16 = 3;
 /// Floor for the node table so a tiny pool still has a usable pane.
 const MIN_NODE_TABLE_ROWS: u16 = 6;
+
+/// Single source of truth for the interactive keys: the footer hint and the
+/// `?` overlay are both derived from this table, so neither can drift from
+/// the actual bindings.
+const BINDINGS: &[(&str, &str)] = &[
+    ("Tab/←/→", "focus another class"),
+    ("k/↑ j/↓", "move node selection"),
+    ("Enter", "switch the focused class to the selected node"),
+    ("t", "probe every node end-to-end"),
+    ("s", "subscription profiles (e edits the URL)"),
+    ("/", "filter the node table (Enter commit, Esc clear)"),
+    ("c", "show proxy exports for the focused class"),
+    ("?", "toggle this help"),
+    ("q/Esc", "quit"),
+];
+
+/// Semantic color tokens: the only place raw palette values appear. Every
+/// render site asks for a meaning (ok, warn, …), never a literal color.
+mod tokens {
+    use ratatui::style::{Color, Modifier, Style};
+
+    pub const OK: Color = Color::Green;
+    pub const WARN: Color = Color::Yellow;
+    pub const ERROR: Color = Color::Red;
+    pub const MUTED: Color = Color::DarkGray;
+    pub const ACCENT: Color = Color::Cyan;
+
+    pub fn ok_bold() -> Style {
+        Style::default().fg(OK).add_modifier(Modifier::BOLD)
+    }
+    pub fn muted() -> Style {
+        Style::default().fg(MUTED)
+    }
+    pub fn accent() -> Style {
+        Style::default().fg(ACCENT)
+    }
+    /// Focused row/class emphasis (video reverse), shared by every table.
+    pub fn focus() -> Style {
+        Style::new().add_modifier(Modifier::REVERSED)
+    }
+}
+
+/// Honest data-age verdict for the live snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    Fresh,
+    Stale,
+    VeryStale,
+}
+
+fn staleness(age: Option<Duration>) -> Staleness {
+    let Some(age) = age else {
+        return Staleness::VeryStale;
+    };
+    if age > REFRESH_EVERY * VERY_STALE_AFTER {
+        Staleness::VeryStale
+    } else if age > REFRESH_EVERY * STALE_AFTER {
+        Staleness::Stale
+    } else {
+        Staleness::Fresh
+    }
+}
+
+/// The mutation a background task is running, plus everything needed to
+/// classify and apply its reply without touching shared state.
+#[derive(Debug, Clone)]
+enum MutationKind {
+    NodeSwitch { node: String },
+    ProbeAll {
+        requested_tag: Option<ProbeRoundTag>,
+    },
+    SubscriptionSwitch {
+        previous: String,
+        requested: String,
+        generation_before: u64,
+    },
+}
+
+impl MutationKind {
+    fn request(&self, class: &str) -> Request {
+        match self {
+            Self::NodeSwitch { node } => Request::Switch {
+                class: class.to_string(),
+                node: node.clone(),
+            },
+            Self::ProbeAll { .. } => Request::ProbeNow {
+                class: class.to_string(),
+            },
+            Self::SubscriptionSwitch { requested, .. } => Request::SwitchSubscription {
+                name: requested.clone(),
+            },
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        match self {
+            Self::NodeSwitch { .. } => SWITCH_TIMEOUT,
+            Self::ProbeAll { .. } => PROBE_TIMEOUT,
+            Self::SubscriptionSwitch { .. } => SUBSCRIPTION_SWITCH_TIMEOUT,
+        }
+    }
+
+    fn busy_message(&self, class: &str) -> String {
+        match self {
+            Self::NodeSwitch { node } => {
+                format!("switching to {node} — pre-check in progress…")
+            }
+            Self::ProbeAll { .. } => {
+                format!("probing all nodes end-to-end (class {class})…")
+            }
+            Self::SubscriptionSwitch { requested, .. } => format!(
+                "switching subscription to {requested} — staging checked paths…"
+            ),
+        }
+    }
+}
+
+/// One request running on a background task. The draw loop polls the
+/// receiver each turn; a reply is applied only when its guards still match
+/// the world it was issued for.
+struct InFlight {
+    /// The mutation being run when this is the mutation lane.
+    kind: Option<MutationKind>,
+    /// Class the request was issued for. A status reply describing another
+    /// class is a superseded frame and is discarded.
+    class: String,
+    /// Epoch at issue time; bumped on class change and mutation submission.
+    /// A mismatch means the reply describes a world the operator has
+    /// already moved past.
+    epoch: u64,
+    rx: oneshot::Receiver<anyhow::Result<control::Reply>>,
+}
+
+/// Run one control request on a background task. The returned receiver
+/// completes with the reply (or the request error/timeout); dropping the
+/// receiver just discards the answer — the daemon side is a checked
+/// transaction either way.
+fn spawn_request(
+    socket: PathBuf,
+    req: Request,
+    timeout: Duration,
+) -> oneshot::Receiver<anyhow::Result<control::Reply>> {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let client = Client::new(socket);
+        let reply = client.request(&req, timeout).await;
+        let _ = tx.send(reply);
+    });
+    rx
+}
 
 struct SubscriptionPicker {
     entries: Vec<control::SubscriptionSummary>,
@@ -177,6 +352,9 @@ struct App {
     cfg_classes: Vec<String>,
     /// Gateway listen per class (index-aligned with `cfg_classes`)
     listens: Vec<String>,
+    /// Per-class selection policy summary (index-aligned with `cfg_classes`),
+    /// from local config for the offline-synthesis path
+    class_selections: Vec<String>,
     class_idx: usize,
     /// State file — last known good when the daemon is unreachable
     state_file: PathBuf,
@@ -205,10 +383,42 @@ struct App {
     /// Live status always carries an authoritative generation; an offline
     /// state file can still provide useful global node data without it.
     generation_known: bool,
-    /// Display order: scored first, unprobed last
+    /// Display order: scored first, unprobed last; narrowed by the filter
     order: Vec<String>,
+    /// The same ordering before the filter, so recommendations and the
+    /// "filtered n/m" count speak about the whole pool, not the visible
+    /// subset.
+    order_full: Vec<String>,
     selected: usize,
-    busy: bool,
+    /// Background-request lanes: at most one request per lane, replies
+    /// applied on the draw loop.
+    status_flight: Option<InFlight>,
+    events_flight: Option<InFlight>,
+    mutation_flight: Option<InFlight>,
+    /// Bumped on class change and mutation boundaries; in-flight frames
+    /// carrying an older epoch are discarded on landing.
+    epoch: u64,
+    /// When the last live snapshot landed (age/STALE honesty).
+    last_live: Option<Instant>,
+    /// Own cadence clock for the events lane. A shared clock would either
+    /// starve events while status answers promptly or re-spawn them every
+    /// tick while status hangs — each lane paces itself.
+    last_events_refresh: Instant,
+    /// `updated_unix` of the last state file the offline path could read.
+    state_updated_unix: Option<i64>,
+    /// Active node-table filter (`/`); None when unfiltered.
+    filter: Option<String>,
+    /// Whether filter keystrokes are being captured.
+    filter_edit: bool,
+    /// Whether the `?` key overlay is open.
+    help_open: bool,
+    /// Set when q/Esc is pressed while a mutation is in flight; quitting
+    /// then requires a second keypress so an outcome is not casually
+    /// abandoned (Ctrl-C stays the hard exit).
+    quit_armed: bool,
+    /// Diagnostics + count-test surface: requests issued per lane.
+    status_spawns: u64,
+    events_spawns: u64,
     message: String,
     message_level: MessageLevel,
     /// Recent daemon events (newest last)
@@ -233,6 +443,10 @@ impl App {
                     .map(|cc| cc.listen.to_string())
                     .unwrap_or_else(|| "-".into())
             })
+            .collect();
+        let class_selections = cfg_classes
+            .iter()
+            .map(|c| cfg.class_selection_summary(c))
             .collect();
         let class_idx = cfg_classes.iter().position(|c| c == class).unwrap_or(0);
         let persisted_state = state::load(&cfg.state_file).ok().flatten();
@@ -276,6 +490,7 @@ impl App {
         Self {
             cfg_classes,
             listens,
+            class_selections,
             class_idx,
             state_file: cfg.state_file.clone(),
             subs,
@@ -291,8 +506,21 @@ impl App {
             snapshot: None,
             generation_known: false,
             order: Vec::new(),
+            order_full: Vec::new(),
             selected: 0,
-            busy: false,
+            status_flight: None,
+            events_flight: None,
+            mutation_flight: None,
+            epoch: 0,
+            last_live: None,
+            last_events_refresh: Instant::now(),
+            state_updated_unix: None,
+            filter: None,
+            filter_edit: false,
+            help_open: false,
+            quit_armed: false,
+            status_spawns: 0,
+            events_spawns: 0,
             message: String::new(),
             message_level: MessageLevel::Info,
             events: Vec::new(),
@@ -303,6 +531,14 @@ impl App {
             rate_down: 0.0,
             last_refresh: Instant::now(),
         }
+    }
+
+    /// Whether a mutation is running on the background lane. Table
+    /// navigation, filtering, help, and quit stay available; class
+    /// switching and further mutations wait (the class guard keeps a
+    /// mutation's outcome observable).
+    fn busy(&self) -> bool {
+        self.mutation_flight.is_some()
     }
 
     fn class(&self) -> &str {
@@ -668,35 +904,48 @@ pub async fn run_noninteractive(
 }
 
 pub async fn run(cfg: &Config, class: &str) -> anyhow::Result<()> {
-    let client = Client::new(control::socket_path(cfg));
+    let socket = control::socket_path(cfg);
+    let client = Client::new(socket.clone());
     if !std::io::stdout().is_terminal() {
         return print_plain(cfg, class, &client).await;
     }
 
     let mut app = App::new(cfg, class);
+    // One blocking refresh before the alternate screen so the first frame is
+    // populated; from here on every request runs on the spine.
     refresh(&client, &mut app).await;
 
     let mut terminal = ratatui::init();
-    let res = tui_loop(&mut terminal, &client, &mut app).await;
+    let res = tui_loop(&mut terminal, &socket, &mut app).await;
     ratatui::restore();
     res
 }
 
 async fn tui_loop(
     terminal: &mut DefaultTerminal,
-    client: &Client,
+    socket: &PathBuf,
     app: &mut App,
 ) -> anyhow::Result<()> {
     loop {
+        poll_flights(app);
         terminal.draw(|f| ui(f, app))?;
 
-        if event::poll(Duration::from_millis(400))? {
+        if event::poll(POLL_EVERY)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         return Ok(());
+                    }
+                    if app.help_open {
+                        // Any key dismisses the overlay; it never mutates.
+                        app.help_open = false;
+                        continue;
+                    }
+                    if app.filter_edit {
+                        filter_edit_key(app, key.code);
+                        continue;
                     }
                     if app.subscription_picker.is_some() {
                         match picker_key(app, key.code) {
@@ -713,157 +962,396 @@ async fn tui_loop(
                                     .authoritative_active_subscription()
                                     .unwrap_or_default()
                                     .to_string();
-                                let subscription_generation_before_request = app
+                                let generation_before = app
                                     .authoritative_subscription_snapshot()
                                     .and_then(|snapshot| snapshot.subscription_generation)
                                     .expect(
                                         "mutation authorization requires reconciliation fields",
                                     );
-                                app.busy = true;
-                                app.set_message(
-                                    MessageLevel::Info,
-                                    format!(
-                                        "switching subscription to {name} — staging checked paths…"
-                                    ),
-                                );
-                                terminal.draw(|f| ui(f, app))?;
-                                let reply = client
-                                    .request(
-                                        &Request::SwitchSubscription { name: name.clone() },
-                                        SUBSCRIPTION_SWITCH_TIMEOUT,
-                                    )
-                                    .await;
-                                let changed = apply_subscription_reply_result(
+                                submit_mutation(
                                     app,
-                                    classify_subscription_reply(reply),
-                                    previous,
-                                    name,
-                                    subscription_generation_before_request,
+                                    socket,
+                                    MutationKind::SubscriptionSwitch {
+                                        previous,
+                                        requested: name,
+                                        generation_before,
+                                    },
                                 );
-                                app.busy = false;
-                                if changed {
-                                    app.selected = 0;
-                                    app.traffic_seed = None;
-                                    app.rate_up = 0.0;
-                                    app.rate_down = 0.0;
-                                }
-                                app.last_refresh = Instant::now() - REFRESH_EVERY;
-                                refresh(client, app).await;
                             }
                         }
                         continue;
                     }
 
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('k') | KeyCode::Up => select_up(app),
-                        KeyCode::Char('j') | KeyCode::Down => select_down(app),
-                        KeyCode::Char('s') => {
-                            if !app.busy {
-                                open_subscription_picker(app);
-                            }
-                        }
-                        KeyCode::Tab
-                        | KeyCode::BackTab
-                        | KeyCode::Left
-                        | KeyCode::Right => {
-                            if app.busy || app.cfg_classes.len() < 2 {
-                                continue;
-                            }
-                            let n = app.cfg_classes.len();
-                            let forward = matches!(key.code, KeyCode::Tab | KeyCode::Right);
-                            app.class_idx = if forward {
-                                (app.class_idx + 1) % n
-                            } else {
-                                (app.class_idx + n - 1) % n
-                            };
-                            app.snapshot = None;
-                            app.generation_known = false;
-                            app.last_probe_round = None;
-                            app.order.clear();
-                            app.selected = 0;
-                            app.traffic_seed = None;
-                            app.rate_up = 0.0;
-                            app.rate_down = 0.0;
-                            app.set_message(MessageLevel::Info, format!("class {}", app.class()));
-                            refresh(client, app).await;
-                        }
-                        KeyCode::Char('t') => {
-                            if app.busy {
-                                continue;
-                            }
-                            app.busy = true;
-                            app.set_message(
-                                MessageLevel::Info,
-                                format!("probing all nodes end-to-end (class {})…", app.class()),
-                            );
-                            // Draw the busy state before blocking on the daemon
-                            terminal.draw(|f| ui(f, app))?;
-                            let requested_tag = app.snapshot.as_ref().and_then(probe_round_tag);
-                            let reply = client
-                                .request(
-                                    &Request::ProbeNow {
-                                        class: app.class().to_string(),
-                                    },
-                                    PROBE_TIMEOUT,
-                                )
-                                .await;
-                            let outcome = classify_probe_reply(reply, requested_tag);
-                            app.last_probe_round = outcome.round;
-                            app.set_message(outcome.level, outcome.message);
-                            app.busy = false;
-                            // Stats changed server-side; show them immediately
-                            refresh(client, app).await;
-                            if let Some((ok, total)) = outcome.counts {
-                                let (level, message) = completed_probe_message(
-                                    ok,
-                                    total,
-                                    app.last_probe_round.is_some(),
-                                    recommended_node(app),
-                                );
-                                app.set_message(level, message);
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if app.busy {
-                                continue;
-                            }
-                            let Some(node) = app.order.get(app.selected).cloned() else {
-                                continue;
-                            };
-                            app.busy = true;
-                            app.set_message(
-                                MessageLevel::Info,
-                                format!("switching to {node} — pre-check in progress…"),
-                            );
-                            // Draw the busy state before blocking on the daemon
-                            terminal.draw(|f| ui(f, app))?;
-                            let reply = client
-                                .request(
-                                    &Request::Switch {
-                                        class: app.class().to_string(),
-                                        node: node.clone(),
-                                    },
-                                    SWITCH_TIMEOUT,
-                                )
-                                .await;
-                            let (level, message) = classify_switch_reply(reply, &node);
-                            app.set_message(level, message);
-                            app.busy = false;
-                            // Force an immediate refresh so the new active node shows
-                            app.last_refresh = Instant::now() - REFRESH_EVERY;
-                            refresh(client, app).await;
-                        }
-                        _ => {}
+                    match dashboard_key(app, socket, key.code) {
+                        KeyAction::None => {}
+                        KeyAction::Quit => return Ok(()),
                     }
                 }
                 _ => {}
             }
         }
 
-        if !app.busy && app.last_refresh.elapsed() >= REFRESH_EVERY {
-            refresh(client, app).await;
+        maybe_spawn_refresh(app, socket);
+    }
+}
+
+/// Outcome of a dashboard key press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    None,
+    Quit,
+}
+
+/// Normal-mode key dispatch. Extracted from the draw loop so the key table
+/// is testable one binding at a time (help stays derivable, never
+/// hand-synced).
+fn dashboard_key(app: &mut App, socket: &PathBuf, key: KeyCode) -> KeyAction {
+    match key {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            if app.busy() && !app.quit_armed {
+                app.quit_armed = true;
+                app.set_message(
+                    MessageLevel::Warning,
+                    "change in flight — press q again to quit (the daemon finishes it either way)",
+                );
+                return KeyAction::None;
+            }
+            KeyAction::Quit
         }
+        KeyCode::Char('?') => {
+            app.help_open = true;
+            KeyAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            select_up(app);
+            KeyAction::None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            select_down(app);
+            KeyAction::None
+        }
+        KeyCode::Char('/') => {
+            app.filter = Some(app.filter.take().unwrap_or_default());
+            app.filter_edit = true;
+            KeyAction::None
+        }
+        KeyCode::Char('c') => {
+            if !app.busy() {
+                app.set_message(
+                    MessageLevel::Info,
+                    format!("copy: {}", proxy_export_line(app.listen())),
+                );
+            }
+            KeyAction::None
+        }
+        KeyCode::Char('s') => {
+            if !app.busy() {
+                open_subscription_picker(app);
+            }
+            KeyAction::None
+        }
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+            if app.busy() || app.cfg_classes.len() < 2 {
+                return KeyAction::None;
+            }
+            change_class(app, matches!(key, KeyCode::Tab | KeyCode::Right));
+            KeyAction::None
+        }
+        KeyCode::Char('t') => {
+            if !app.busy() {
+                let requested_tag = app.snapshot.as_ref().and_then(probe_round_tag);
+                submit_mutation(app, socket, MutationKind::ProbeAll { requested_tag });
+            }
+            KeyAction::None
+        }
+        KeyCode::Enter => {
+            if !app.busy() {
+                if let Some(node) = app.order.get(app.selected).cloned() {
+                    submit_mutation(app, socket, MutationKind::NodeSwitch { node });
+                }
+            }
+            KeyAction::None
+        }
+        _ => KeyAction::None,
+    }
+}
+
+/// Focus another class: clear every per-class view state (snapshot, probe
+/// round, filter, rates), supersede in-flight status frames, and mark the
+/// refresh due so the new class paints immediately.
+fn change_class(app: &mut App, forward: bool) {
+    let n = app.cfg_classes.len();
+    app.class_idx = if forward {
+        (app.class_idx + 1) % n
+    } else {
+        (app.class_idx + n - 1) % n
+    };
+    app.snapshot = None;
+    app.generation_known = false;
+    app.last_probe_round = None;
+    app.order.clear();
+    app.order_full.clear();
+    app.selected = 0;
+    app.traffic_seed = None;
+    app.rate_up = 0.0;
+    app.rate_down = 0.0;
+    app.filter = None;
+    app.filter_edit = false;
+    app.set_message(MessageLevel::Info, format!("class {}", app.class()));
+    app.epoch += 1;
+    app.status_flight = None;
+    app.last_refresh = Instant::now() - REFRESH_EVERY;
+}
+
+/// Whether the status lane should issue a request now: cadence due, no
+/// request in flight (never overlap), independent of any pending mutation.
+fn should_spawn_status(app: &App) -> bool {
+    app.last_refresh.elapsed() >= REFRESH_EVERY && app.status_flight.is_none()
+}
+
+/// Events are advisory daemon-memory state: fetched on their OWN cadence
+/// clock (a shared clock lets a fast status lane starve them and a slow one
+/// turn them into a per-tick poller), only while connected, never twice at
+/// once.
+fn should_spawn_events(app: &App) -> bool {
+    app.connected
+        && app.events_flight.is_none()
+        && app.last_events_refresh.elapsed() >= REFRESH_EVERY
+}
+
+fn maybe_spawn_refresh(app: &mut App, socket: &PathBuf) {
+    if should_spawn_status(app) {
+        app.last_refresh = Instant::now();
+        app.status_spawns += 1;
+        app.status_flight = Some(InFlight {
+            kind: None,
+            class: app.class().to_string(),
+            epoch: app.epoch,
+            rx: spawn_request(
+                socket.clone(),
+                Request::Status {
+                    class: app.class().to_string(),
+                },
+                STATUS_TIMEOUT,
+            ),
+        });
+    }
+    if should_spawn_events(app) {
+        app.last_events_refresh = Instant::now();
+        app.events_spawns += 1;
+        app.events_flight = Some(InFlight {
+            kind: None,
+            class: app.class().to_string(),
+            epoch: app.epoch,
+            rx: spawn_request(socket.clone(), Request::Events, STATUS_TIMEOUT),
+        });
+    }
+}
+
+/// The socket-free half of submitting a mutation: bump the epoch so status
+/// frames already in flight (they describe the pre-mutation world) are
+/// discarded on landing, and stage the lane slot around the caller's
+/// receiver.
+fn prepare_mutation(
+    app: &mut App,
+    kind: MutationKind,
+    rx: oneshot::Receiver<anyhow::Result<control::Reply>>,
+) -> InFlight {
+    app.epoch += 1;
+    InFlight {
+        kind: Some(kind),
+        class: app.class().to_string(),
+        epoch: app.epoch,
+        rx,
+    }
+}
+
+/// Submit a mutation on the background lane. Refuses to overlap: a second
+/// mutation while one runs would drop the first reply unobserved.
+fn submit_mutation(app: &mut App, socket: &PathBuf, kind: MutationKind) {
+    if app.mutation_flight.is_some() {
+        app.set_message(
+            MessageLevel::Warning,
+            "another change is already in progress",
+        );
+        return;
+    }
+    app.set_message(MessageLevel::Info, kind.busy_message(app.class()));
+    let rx = spawn_request(socket.clone(), kind.request(app.class()), kind.timeout());
+    app.mutation_flight = Some(prepare_mutation(app, kind, rx));
+}
+
+/// Apply every completed background reply. Pending requests keep waiting;
+/// a task that died without answering degrades like a request error.
+fn poll_flights(app: &mut App) {
+    if let Some((flight, result)) = take_completed(&mut app.status_flight) {
+        complete_status_reply(app, flight, result);
+    }
+    if let Some((flight, result)) = take_completed(&mut app.events_flight) {
+        complete_events_reply(app, flight, result);
+    }
+    if let Some((flight, result)) = take_completed(&mut app.mutation_flight) {
+        complete_mutation(app, flight, result);
+    }
+}
+
+fn take_completed(
+    flight: &mut Option<InFlight>,
+) -> Option<(InFlight, anyhow::Result<control::Reply>)> {
+    let inflight = flight.as_mut()?;
+    match inflight.rx.try_recv() {
+        Ok(result) => {
+            let inflight = flight.take().expect("receiver was Some");
+            Some((inflight, result))
+        }
+        Err(oneshot::error::TryRecvError::Empty) => None,
+        Err(oneshot::error::TryRecvError::Closed) => {
+            let inflight = flight.take().expect("receiver was Some");
+            Some((
+                inflight,
+                Err(anyhow::anyhow!("background request task failed")),
+            ))
+        }
+    }
+}
+
+fn complete_status_reply(
+    app: &mut App,
+    flight: InFlight,
+    result: anyhow::Result<control::Reply>,
+) {
+    if flight.class != app.class() || flight.epoch != app.epoch {
+        // Superseded frame: the operator changed class or a mutation landed
+        // in between; the next cadence tick repaints the current world.
+        return;
+    }
+    match result {
+        Ok(reply) if reply.ok => {
+            if let Some(snap) = reply.status {
+                apply_live_snapshot(app, snap);
+                rebuild_order(app);
+            }
+            // ok-without-snapshot keeps the previous data; next tick retries
+        }
+        _ => {
+            app.connected = false;
+            // No live data anymore: the age display must not claim any.
+            app.last_live = None;
+            refresh_from_file(app);
+            rebuild_order(app);
+        }
+    }
+}
+
+fn complete_events_reply(app: &mut App, flight: InFlight, result: anyhow::Result<control::Reply>) {
+    if flight.epoch != app.epoch {
+        return;
+    }
+    // Advisory: a failed fetch keeps the previous list.
+    if let Ok(reply) = result {
+        if reply.ok {
+            if let Some(evs) = reply.events {
+                app.events = evs;
+            }
+        }
+    }
+}
+
+fn complete_mutation(app: &mut App, flight: InFlight, result: anyhow::Result<control::Reply>) {
+    // Class switching is refused while a mutation runs, so a class mismatch
+    // here is defensive only.
+    if flight.class != app.class() {
+        return;
+    }
+    let Some(kind) = flight.kind else {
+        return;
+    };
+    match kind {
+        MutationKind::NodeSwitch { node } => {
+            let (level, message) = classify_switch_reply(result, &node);
+            app.set_message(level, message);
+        }
+        MutationKind::ProbeAll { requested_tag } => {
+            let outcome = classify_probe_reply(result, requested_tag);
+            app.last_probe_round = outcome.round;
+            app.set_message(outcome.level, outcome.message);
+            rebuild_order(app);
+            if let Some((ok, total)) = outcome.counts {
+                let (level, message) = completed_probe_message(
+                    ok,
+                    total,
+                    app.last_probe_round.is_some(),
+                    recommended_node(app),
+                );
+                app.set_message(level, message);
+            }
+        }
+        MutationKind::SubscriptionSwitch {
+            previous,
+            requested,
+            generation_before,
+        } => {
+            let changed = apply_subscription_reply_result(
+                app,
+                classify_subscription_reply(result),
+                previous,
+                requested,
+                generation_before,
+            );
+            if changed {
+                app.selected = 0;
+                app.traffic_seed = None;
+                app.rate_up = 0.0;
+                app.rate_down = 0.0;
+                // The pool changed wholesale; a name fragment from the old
+                // pool is noise, not a filter.
+                app.filter = None;
+                app.filter_edit = false;
+            }
+        }
+    }
+    // A status frame spawned during the mutation snapshots a pre-commit
+    // world and carries the post-submission epoch, so the epoch guard alone
+    // cannot catch it — supersede it explicitly, which also frees the lane
+    // for the forced refresh below.
+    app.epoch += 1;
+    app.status_flight = None;
+    app.quit_armed = false;
+    // Server-side state changed; paint the authoritative world immediately.
+    app.last_refresh = Instant::now() - REFRESH_EVERY;
+}
+
+/// Key handling while the `/` filter captures input.
+fn filter_edit_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            app.filter = None;
+            app.filter_edit = false;
+            rebuild_order(app);
+        }
+        KeyCode::Enter => {
+            app.filter_edit = false;
+            if app
+                .filter
+                .as_ref()
+                .is_some_and(|pattern| pattern.is_empty())
+            {
+                app.filter = None;
+            }
+            rebuild_order(app);
+        }
+        KeyCode::Backspace => {
+            app.filter.get_or_insert_with(String::new).pop();
+            rebuild_order(app);
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            let pattern = app.filter.get_or_insert_with(String::new);
+            if pattern.chars().count() < FILTER_MAX_CHARS {
+                pattern.push(c);
+            }
+            rebuild_order(app);
+        }
+        _ => {}
     }
 }
 
@@ -1115,6 +1603,9 @@ fn write_subscription_url_atomic(path: &std::path::Path, url: &str) -> std::io::
 /// Fetch a live snapshot + events over the control socket; on snapshot
 /// failure, degrade to the state file (last known good) and mark the daemon
 /// unreachable.
+/// Startup-only synchronous refresh: one status + events round before the
+/// alternate screen so the first frame is populated. Once the TUI loop
+/// starts, every request runs on the background spine instead.
 async fn refresh(client: &Client, app: &mut App) {
     app.last_refresh = Instant::now();
     match client
@@ -1134,6 +1625,7 @@ async fn refresh(client: &Client, app: &mut App) {
         }
         _ => {
             app.connected = false;
+            app.last_live = None;
             refresh_from_file(app);
         }
     }
@@ -1157,6 +1649,7 @@ fn apply_live_snapshot(app: &mut App, snap: StatusSnapshot) {
     app.snapshot = Some(snap);
     app.generation_known = true;
     app.connected = true;
+    app.last_live = Some(Instant::now());
 }
 
 fn rebuild_order(app: &mut App) {
@@ -1169,19 +1662,32 @@ fn rebuild_order(app: &mut App) {
     {
         app.last_probe_round = None;
     }
-    app.order = ordered_names(
+    let mut order = ordered_names(
         app.snapshot.as_ref(),
         &app.subs,
         app.last_probe_round.as_ref(),
     );
+    app.order_full = order.clone();
+    if let Some(pattern) = app
+        .filter
+        .as_ref()
+        .filter(|pattern| !pattern.is_empty())
+        .map(|pattern| pattern.to_lowercase())
+    {
+        order.retain(|name| name.to_lowercase().contains(&pattern));
+    }
+    app.order = order;
     app.selected = selected_node
         .as_ref()
         .and_then(|node| app.order.iter().position(|candidate| candidate == node))
         .unwrap_or_else(|| app.selected.min(app.order.len().saturating_sub(1)));
 }
 
+/// The pool-wide recommendation, independent of the active filter: the
+/// "recommended X" message and the BEST badge must speak about the whole
+/// pool, not the visible subset.
 fn recommended_node(app: &App) -> Option<&str> {
-    let node = app.order.first()?;
+    let node = app.order_full.first()?;
     app.last_probe_round
         .as_ref()?
         .results
@@ -1192,6 +1698,7 @@ fn recommended_node(app: &App) -> Option<&str> {
 
 fn refresh_from_file(app: &mut App) {
     if let Ok(Some(st)) = state::load(&app.state_file) {
+        app.state_updated_unix = Some(st.updated_unix);
         let active_subscription = st
             .active_subscription
             .clone()
@@ -1245,6 +1752,7 @@ fn refresh_from_file(app: &mut App) {
         // A missing, unreadable, or corrupt state file provides no evidence
         // about the active profile or node. Preserve the configured catalog
         // for view-only inspection, but clear every stale runtime assertion.
+        app.state_updated_unix = None;
         app.offline_subscription = app
             .configured_default_subscription
             .clone()
@@ -1557,6 +2065,11 @@ fn class_overviews_from_state(app: &App, st: &state::StateFile) -> Vec<control::
                     .unwrap_or_else(|| "-".into()),
                 active_node: cs.and_then(|c| c.active_node.clone()),
                 generation: cs.map(|c| c.generation).unwrap_or(0),
+                selection: app
+                    .class_selections
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -1598,6 +2111,11 @@ fn synthesized_class_overviews(app: &App) -> Vec<control::ClassOverview> {
                 listen,
                 active_node,
                 generation,
+                selection: app
+                    .class_selections
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -1623,15 +2141,32 @@ fn dashboard_pane_heights(total: u16, class_count: usize, node_count: usize) -> 
     [class_h, table_h, events_h, footer_h]
 }
 
-fn class_strip_column_lengths(total_width: u16) -> [u16; 4] {
-    let budget = total_width.saturating_sub(8).max(40);
-    let class_w = 12u16.min(budget);
-    let gateway_w = 22u16.min(budget.saturating_sub(class_w));
-    let gen_w = 6u16.min(budget.saturating_sub(class_w.saturating_add(gateway_w)));
-    let node_w = budget
-        .saturating_sub(class_w.saturating_add(gateway_w).saturating_add(gen_w))
-        .max(10);
-    [class_w, gateway_w, node_w, gen_w]
+/// Column layout for the five-column class strip: CLASS, GATEWAY, NODE,
+/// SELECTION, GEN. Shrinks toward per-column minima (SELECTION first — it
+/// is pure annotation — then NODE, GATEWAY, CLASS) so the widths fit the
+/// terminal budget down to the minima sum; below that ratatui clips rather
+/// than wraps.
+fn class_strip_column_lengths(total_width: u16) -> [u16; 5] {
+    let mut widths = [12, 20, 26, 18, 6];
+    let minima = [6, 10, 10, 0, 3];
+    let budget = total_width.saturating_sub(8);
+    let shrink_order = [3, 2, 1, 0, 4];
+    while widths.iter().sum::<u16>() > budget {
+        let mut changed = false;
+        for index in shrink_order {
+            if widths[index] > minima[index] {
+                widths[index] -= 1;
+                changed = true;
+                if widths.iter().sum::<u16>() <= budget {
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    widths
 }
 
 fn ui(f: &mut Frame, app: &App) {
@@ -1670,7 +2205,7 @@ fn ui(f: &mut Frame, app: &App) {
             let best = recommended_node(app) == Some(name.as_str());
             let (name_cell, status) = if active == Some(name.as_str()) {
                 (
-                    Cell::from(format!("◉ {name}")).style(Style::default().fg(Color::Green).bold()),
+                    Cell::from(format!("◉ {name}")).style(tokens::ok_bold()),
                     if best { "A/BEST" } else { "ACTIVE" },
                 )
             } else {
@@ -1723,12 +2258,8 @@ fn ui(f: &mut Frame, app: &App) {
             ])
             .style(Style::default().bold()),
         )
-        .block(Block::bordered().title(format!(
-            " {} {} · Enter switches this class ",
-            app.class(),
-            app.listen()
-        )))
-        .row_highlight_style(Style::new().reversed())
+        .block(Block::bordered().title(node_table_title(app)))
+        .row_highlight_style(tokens::focus())
         .highlight_symbol("› ");
 
     let mut state = TableState::default();
@@ -1740,14 +2271,12 @@ fn ui(f: &mut Frame, app: &App) {
 
     f.render_stateful_widget(table, table_area, &mut state);
 
-    // Recent-events feed: the daemon's "what just happened" answer.
+    // Recent-events feed: the daemon's "what just happened" answer. Kind
+    // coloring is per-event; history rows are never rewritten.
     let now = state::now_unix();
     let ev_capacity = events_area.height.saturating_sub(2) as usize;
     let ev_lines: Vec<Line> = if app.events.is_empty() {
-        vec![Line::from(Span::styled(
-            "no events yet",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        vec![Line::from(Span::styled("no events yet", tokens::muted()))]
     } else {
         let width = events_area.width.saturating_sub(2) as usize;
         app.events
@@ -1759,7 +2288,7 @@ fn ui(f: &mut Frame, app: &App) {
                 if line.chars().count() > width {
                     line = crate::truncate(&line, width);
                 }
-                Line::from(line)
+                Line::from(Span::styled(line, Style::default().fg(event_color(e))))
             })
             .collect()
     };
@@ -1778,16 +2307,10 @@ fn ui(f: &mut Frame, app: &App) {
             fmt_rate(app.rate_up),
             fmt_rate(app.rate_down),
         ),
-        Style::default().fg(Color::DarkGray),
+        tokens::muted(),
     );
-    let help = Span::styled(
-        if app.subscription_mutation_allowed() {
-            "Tab/←/→ class │ k/↑ j/↓ node │ Enter switch │ s subscription │ t test all │ q quit"
-        } else {
-            "Tab/←/→ class │ k/↑ j/↓ node │ Enter switch │ s subscriptions (view-only) │ t test all │ q quit"
-        },
-        Style::default().fg(Color::DarkGray),
-    );
+    // Derived from BINDINGS so the hint and the `?` overlay cannot drift.
+    let help = Span::styled(footer_keys_hint(), tokens::muted());
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(message, Style::default().fg(color))),
@@ -1800,6 +2323,83 @@ fn ui(f: &mut Frame, app: &App) {
     if let Some(picker) = &app.subscription_picker {
         render_subscription_picker(f, app, picker);
     }
+    if app.help_open {
+        render_help_overlay(f);
+    }
+}
+
+/// Node-table title: plain, filter-editing (with the live pattern), or
+/// filtered with an honest narrowed/total count.
+fn node_table_title(app: &App) -> String {
+    let active = app
+        .filter
+        .as_ref()
+        .is_some_and(|pattern| !pattern.is_empty());
+    if app.filter_edit {
+        let pattern = app.filter.clone().unwrap_or_default();
+        format!(" {} {} · filter: {pattern}▏ ", app.class(), app.listen())
+    } else if active {
+        format!(
+            " {} {} · filtered {}/{} ",
+            app.class(),
+            app.listen(),
+            app.order.len(),
+            app.order_full.len()
+        )
+    } else {
+        format!(" {} {} · Enter switches this class ", app.class(), app.listen())
+    }
+}
+
+/// One foreground color per event kind: successes read green, failures red,
+/// routine cycles stay muted, subscription changes accent.
+fn event_color(e: &control::Event) -> Color {
+    match e {
+        control::Event::Switched { .. } => tokens::OK,
+        control::Event::ActivationFailed { .. }
+        | control::Event::HealthFailed { .. }
+        | control::Event::SubscriptionChangeFailed { .. } => tokens::ERROR,
+        control::Event::SubscriptionChanged { .. } => tokens::ACCENT,
+        control::Event::Probed { .. } | control::Event::Reloaded { .. } => tokens::MUTED,
+    }
+}
+
+/// The footer's compact key list, derived from BINDINGS.
+fn footer_keys_hint() -> String {
+    BINDINGS
+        .iter()
+        .map(|(keys, _)| *keys)
+        .collect::<Vec<_>>()
+        .join(" │ ")
+}
+
+/// Paste-ready proxy exports for the focused class's gateway. Displayed in
+/// the message line only — no clipboard is claimed; copying is terminal
+/// selection. socks5h keeps remote DNS resolution on the gateway.
+fn proxy_export_line(listen: &str) -> String {
+    format!("export http_proxy=http://{listen} https_proxy=http://{listen} all_proxy=socks5h://{listen}")
+}
+
+/// The `?` overlay: every row comes from BINDINGS, so help can never list a
+/// key that does not exist or omit one that does.
+fn render_help_overlay(f: &mut Frame) {
+    let width = 64u16.min(f.area().width);
+    let height = (BINDINGS.len() as u16).saturating_add(2);
+    let area = centered_rect(width, height, f.area());
+    let lines: Vec<Line> = BINDINGS
+        .iter()
+        .map(|(keys, action)| {
+            Line::from(vec![
+                Span::styled(format!("{keys:<12} "), tokens::accent()),
+                Span::raw(*action),
+            ])
+        })
+        .collect();
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" keys ")),
+        area,
+    );
 }
 
 fn render_class_strip(
@@ -1808,17 +2408,44 @@ fn render_class_strip(
     area: Rect,
     overviews: &[control::ClassOverview],
 ) {
-    let daemon = if app.connected {
-        "connected"
+    // Honest connection segment: live age when answering, STALE when slow,
+    // the state file's age when offline. Never paint "connected" over old
+    // or absent data.
+    let (conn_text, conn_color) = if app.connected {
+        match app.last_live.map(|at| at.elapsed()) {
+            None => ("daemon live · no snapshot yet".to_string(), tokens::ERROR),
+            Some(age) => {
+                let age_text = state::human_duration(age.as_secs() as i64);
+                match staleness(Some(age)) {
+                    Staleness::Fresh => {
+                        (format!("daemon live · {age_text} ago"), tokens::MUTED)
+                    }
+                    Staleness::Stale => (
+                        format!("daemon live · STALE {age_text} ago"),
+                        tokens::WARN,
+                    ),
+                    Staleness::VeryStale => (
+                        format!("daemon live · STALE {age_text} ago"),
+                        tokens::ERROR,
+                    ),
+                }
+            }
+        }
     } else {
-        "unreachable"
+        let saved = app
+            .state_updated_unix
+            .map(|unix| format!(" · last state {} old", state::human_age(unix, state::now_unix())))
+            .unwrap_or_else(|| " · no state file".to_string());
+        (format!("daemon unreachable · OFFLINE{saved}"), tokens::ERROR)
     };
-    let title = format!(
-        " CAUSEWAY │ subscription {} │ daemon {}{} ",
-        app.subscription_label(),
-        daemon,
-        if app.connected { "" } else { " │ OFFLINE" },
-    );
+    let title = Line::from(vec![
+        Span::raw(format!(
+            " CAUSEWAY │ subscription {} │ ",
+            app.subscription_label()
+        )),
+        Span::styled(conn_text, Style::default().fg(conn_color)),
+        Span::raw(" "),
+    ]);
     let column_lengths = class_strip_column_lengths(area.width);
     let widths = column_lengths.map(Constraint::Length);
     let rows = overviews.iter().map(|class| {
@@ -1831,21 +2458,28 @@ fn render_class_strip(
             class.generation.to_string()
         };
         let style = if focused {
-            Style::new().reversed()
+            tokens::focus()
         } else {
             Style::default()
+        };
+        let sel_w = column_lengths[3] as usize;
+        let selection = if class.selection.is_empty() {
+            "-".to_string()
+        } else {
+            crate::truncate(&class.selection, sel_w)
         };
         Row::new(vec![
             format!("{marker}{}", class.name),
             class.listen.clone(),
             node.to_string(),
+            selection,
             gen,
         ])
         .style(style)
     });
     let table = Table::new(rows, widths)
         .header(
-            Row::new(["CLASS", "GATEWAY", "NODE", "GEN"]).style(Style::default().bold()),
+            Row::new(["CLASS", "GATEWAY", "NODE", "SEL", "GEN"]).style(Style::default().bold()),
         )
         .block(Block::bordered().title(title));
     f.render_widget(table, area);
@@ -1891,7 +2525,7 @@ fn render_subscription_picker(f: &mut Frame, app: &App, picker: &SubscriptionPic
     let table = Table::new(rows, widths)
         .header(Row::new(headers).style(Style::default().bold()))
         .block(Block::bordered().title(Line::from(" subscriptions ").alignment(Alignment::Center)))
-        .row_highlight_style(Style::new().reversed())
+        .row_highlight_style(tokens::focus())
         .highlight_symbol("› ");
     let mut state = TableState::default().with_selected(Some(
         picker.selected.min(picker.entries.len().saturating_sub(1)),
@@ -1916,18 +2550,18 @@ fn render_subscription_picker(f: &mut Frame, app: &App, picker: &SubscriptionPic
                 "URL for {target}: \u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} ({} chars, hidden) \u{2502} Enter save \u{2502} Esc cancel",
                 buffer.chars().count()
             ),
-            Color::DarkGray,
+            tokens::MUTED,
         )
     } else if app.subscription_mutation_allowed() {
         (
             "k/\u{2191} up \u{2502} j/\u{2193} down \u{2502} Enter switch \u{2502} e edit URL \u{2502} Esc cancel".to_string(),
-            Color::DarkGray,
+            tokens::MUTED,
         )
     } else {
         (
             "VIEW ONLY \u{2502} k/\u{2191} up \u{2502} j/\u{2193} down \u{2502} Esc close"
                 .to_string(),
-            Color::Yellow,
+            tokens::WARN,
         )
     };
     f.render_widget(
@@ -1968,21 +2602,35 @@ fn subscription_picker_columns(total_width: u16) -> (Vec<Constraint>, usize) {
     (widths, visible_columns)
 }
 
-fn footer_message(app: &App) -> (&str, Color) {
+fn footer_message(app: &App) -> (String, Color) {
+    if app.filter_edit {
+        let pattern = app.filter.clone().unwrap_or_default();
+        return (
+            format!("filter: {pattern}▏ │ Enter commit │ Esc clear"),
+            tokens::ACCENT,
+        );
+    }
     if !app.connected {
         if app.offline_subscription.confirmed_name().is_none() {
             return (
-                "OFFLINE — daemon unreachable; no confirmed active subscription (configured catalog only)",
-                Color::Red,
+                "OFFLINE — daemon unreachable; no confirmed active subscription (configured catalog only)"
+                    .to_string(),
+                tokens::ERROR,
             );
         }
+        let saved = app
+            .state_updated_unix
+            .map(|unix| format!(", saved {} ago", state::human_age(unix, state::now_unix())))
+            .unwrap_or_default();
         return (
-            "OFFLINE — daemon unreachable; showing last known state (subscription changes disabled)",
-            Color::Red,
+            format!(
+                "OFFLINE — daemon unreachable; showing last known state{saved} (subscription changes disabled)"
+            ),
+            tokens::ERROR,
         );
     }
-    if app.busy {
-        return (app.message.as_str(), Color::Yellow);
+    if app.busy() {
+        return (app.message.clone(), tokens::WARN);
     }
     if app
         .snapshot
@@ -1990,26 +2638,52 @@ fn footer_message(app: &App) -> (&str, Color) {
         .is_some_and(|snapshot| snapshot.subscription_txn_in_progress == Some(true))
     {
         return (
-            "subscription change in progress — subscription picker is temporarily view-only",
-            Color::Yellow,
+            "subscription change in progress — subscription picker is temporarily view-only"
+                .to_string(),
+            tokens::WARN,
         );
     }
     if !app.message.is_empty() {
         let color = match app.message_level {
-            MessageLevel::Info => Color::DarkGray,
-            MessageLevel::Success => Color::Green,
-            MessageLevel::Warning => Color::Yellow,
-            MessageLevel::Error => Color::Red,
+            MessageLevel::Info => tokens::MUTED,
+            MessageLevel::Success => tokens::OK,
+            MessageLevel::Warning => tokens::WARN,
+            MessageLevel::Error => tokens::ERROR,
         };
-        return (app.message.as_str(), color);
+        return (app.message.clone(), color);
     }
     if app.authoritative_subscription_snapshot().is_none() {
         return (
-            "connected to an older/incompatible daemon — subscription changes disabled",
-            Color::Yellow,
+            "connected to an older/incompatible daemon — subscription changes disabled".to_string(),
+            tokens::WARN,
         );
     }
-    ("live data via control socket", Color::DarkGray)
+    // Default: age-stamped liveness. A daemon that answers slowly must read
+    // as slow, not as fresh. A connected app with no live snapshot yet is a
+    // broken invariant — render it as very stale, never "0s ago".
+    match app.last_live.map(|at| at.elapsed()) {
+        None => (
+            "STALE — no live snapshot this session".to_string(),
+            tokens::ERROR,
+        ),
+        Some(age) => {
+            let age_text = state::human_duration(age.as_secs() as i64);
+            match staleness(Some(age)) {
+                Staleness::Fresh => (
+                    format!("live data via control socket · {age_text} ago"),
+                    tokens::MUTED,
+                ),
+                Staleness::Stale => (
+                    format!("STALE — last live snapshot {age_text} ago"),
+                    tokens::WARN,
+                ),
+                Staleness::VeryStale => (
+                    format!("STALE — daemon answering slowly; data {age_text} old"),
+                    tokens::ERROR,
+                ),
+            }
+        }
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -2052,18 +2726,21 @@ async fn print_plain(cfg: &Config, class: &str, client: &Client) -> anyhow::Resu
 }
 
 fn print_snapshot(s: &StatusSnapshot) {
+    // Source first: a plain report must say where its data came from.
+    pln!("source: live daemon via control socket");
     if !s.classes.is_empty() {
         pln!(
-            "{:<12} {:<22} {:<32} {:<6}",
+            "{:<12} {:<22} {:<32} {:<20} {:<6}",
             "CLASS",
             "GATEWAY",
             "NODE",
+            "SELECTION",
             "GEN"
         );
         for class in &s.classes {
             let marker = if class.name == s.class { "› " } else { "  " };
             pln!(
-                "{:<12} {:<22} {:<32} {:<6}",
+                "{:<12} {:<22} {:<32} {:<20} {:<6}",
                 format!("{marker}{}", class.name),
                 crate::truncate(&class.listen, 22),
                 class
@@ -2071,6 +2748,11 @@ fn print_snapshot(s: &StatusSnapshot) {
                     .as_deref()
                     .map(|n| crate::truncate(n, 32))
                     .unwrap_or_else(|| "<none>".into()),
+                if class.selection.is_empty() {
+                    "-".to_string()
+                } else {
+                    crate::truncate(&class.selection, 20)
+                },
                 class.generation,
             );
         }
@@ -2217,6 +2899,7 @@ mod tests {
         App {
             cfg_classes: vec!["dev".into()],
             listens: vec!["127.0.0.1:17878".into()],
+            class_selections: vec![String::new()],
             class_idx: 0,
             state_file: PathBuf::from("/nonexistent"),
             subs: Vec::new(),
@@ -2232,8 +2915,21 @@ mod tests {
             snapshot: None,
             generation_known: false,
             order: Vec::new(),
+            order_full: Vec::new(),
             selected: 0,
-            busy: false,
+            status_flight: None,
+            events_flight: None,
+            mutation_flight: None,
+            epoch: 0,
+            last_live: None,
+            last_events_refresh: Instant::now(),
+            state_updated_unix: None,
+            filter: None,
+            filter_edit: false,
+            help_open: false,
+            quit_armed: false,
+            status_spawns: 0,
+            events_spawns: 0,
             message: String::new(),
             message_level: MessageLevel::Info,
             events: Vec::new(),
@@ -2296,7 +2992,7 @@ listen = "127.0.0.1:17878"
         let (message, color) = footer_message(&app);
         assert!(message.contains("no confirmed active subscription"));
         assert!(!message.contains("last known"));
-        assert_eq!(color, Color::Red);
+        assert_eq!(color, tokens::ERROR);
 
         // A corrupt state file follows the same branch as a missing one.
         // refresh_from_file must also erase a stale in-memory assertion.
@@ -2585,7 +3281,7 @@ listen = "127.0.0.1:17878"
             message,
             "subscription change in progress — subscription picker is temporarily view-only"
         );
-        assert_eq!(color, Color::Yellow);
+        assert_eq!(color, tokens::WARN);
     }
 
     #[test]
@@ -2894,7 +3590,7 @@ listen = "127.0.0.1:17878"
         app.message_level = MessageLevel::Success;
         let (message, color) = footer_message(&app);
         assert!(message.starts_with("OFFLINE"));
-        assert_eq!(color, Color::Red);
+        assert_eq!(color, tokens::ERROR);
     }
 
     #[test]
@@ -2967,12 +3663,14 @@ listen = "127.0.0.1:17878"
                 listen: "127.0.0.1:17880".into(),
                 active_node: Some("jp-browser".into()),
                 generation: 4,
+                selection: String::new(),
             },
             control::ClassOverview {
                 name: "dev".into(),
                 listen: "127.0.0.1:17878".into(),
                 active_node: Some("hk-dev".into()),
                 generation: 9,
+                selection: String::new(),
             },
         ];
         app.snapshot = Some(snap);
@@ -3236,5 +3934,795 @@ listen = "127.0.0.1:17878"
         );
         assert!(app.subscription_picker.is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- refresh spine: cadence gating, never-overlap, epoch discard ----
+
+    fn dropped_rx() -> oneshot::Receiver<anyhow::Result<control::Reply>> {
+        let (_tx, rx) = oneshot::channel();
+        rx
+    }
+
+    fn flight_for(
+        kind: Option<MutationKind>,
+        class: &str,
+        epoch: u64,
+    ) -> InFlight {
+        InFlight {
+            kind,
+            class: class.to_string(),
+            epoch,
+            rx: dropped_rx(),
+        }
+    }
+
+    #[test]
+    fn status_lane_follows_cadence_and_never_overlaps() {
+        let mut app = app_for_order();
+        app.last_refresh = Instant::now();
+        assert!(!should_spawn_status(&app), "cadence not due yet");
+        app.last_refresh = Instant::now() - REFRESH_EVERY;
+        assert!(should_spawn_status(&app));
+        app.status_flight = Some(flight_for(None, "dev", 0));
+        assert!(
+            !should_spawn_status(&app),
+            "at most one status request in flight"
+        );
+    }
+
+    #[test]
+    fn refresh_lane_is_independent_of_a_pending_mutation() {
+        let mut app = app_for_order();
+        app.last_refresh = Instant::now() - REFRESH_EVERY;
+        app.mutation_flight = Some(flight_for(
+            Some(MutationKind::ProbeAll { requested_tag: None }),
+            "dev",
+            0,
+        ));
+        assert!(app.busy());
+        assert!(
+            should_spawn_status(&app),
+            "a pending mutation must not stall the refresh lane"
+        );
+    }
+
+    #[test]
+    fn events_lane_paces_itself_and_only_fetches_while_connected() {
+        let mut app = app_for_order();
+        app.last_events_refresh = Instant::now() - REFRESH_EVERY;
+        assert!(
+            !should_spawn_events(&app),
+            "offline: events live only in daemon memory"
+        );
+        app.connected = true;
+        assert!(should_spawn_events(&app));
+        app.events_flight = Some(flight_for(None, "dev", 0));
+        assert!(
+            !should_spawn_events(&app),
+            "at most one events request in flight"
+        );
+        // The status lane's clock must not gate events (nor reset it): a
+        // healthy status lane used to starve the feed entirely.
+        app.events_flight = None;
+        app.last_refresh = Instant::now();
+        assert!(
+            should_spawn_events(&app),
+            "events pace on their own clock, not the status clock"
+        );
+    }
+
+    #[test]
+    fn superseded_status_replies_are_discarded_by_class_and_epoch() {
+        let mut app = app_for_order();
+        let mut nodes = BTreeMap::new();
+        nodes.insert("old".into(), stats(0.9, Some(10.0), true));
+        app.snapshot = Some(snapshot(nodes));
+        let fresh = snapshot(BTreeMap::new());
+
+        complete_status_reply(
+            &mut app,
+            flight_for(None, "browser", 0),
+            Ok(control::Reply::ok_status(fresh.clone())),
+        );
+        assert!(
+            app.snapshot.as_ref().unwrap().nodes.contains_key("old"),
+            "a reply for another class is a superseded frame"
+        );
+
+        complete_status_reply(
+            &mut app,
+            flight_for(None, "dev", 9),
+            Ok(control::Reply::ok_status(fresh.clone())),
+        );
+        assert!(
+            app.snapshot.as_ref().unwrap().nodes.contains_key("old"),
+            "a reply from a superseded epoch is discarded"
+        );
+
+        complete_status_reply(
+            &mut app,
+            flight_for(None, "dev", 0),
+            Ok(control::Reply::ok_status(fresh)),
+        );
+        assert!(
+            !app.snapshot.as_ref().unwrap().nodes.contains_key("old"),
+            "a current reply is applied"
+        );
+        assert!(app.connected);
+        assert!(app.last_live.is_some());
+    }
+
+    #[test]
+    fn failed_status_reply_degrades_to_the_state_file() {
+        let mut app = app_for_order();
+        app.connected = true;
+        app.last_live = Some(Instant::now());
+
+        complete_status_reply(
+            &mut app,
+            flight_for(None, "dev", 0),
+            Err(anyhow::anyhow!("timed out")),
+        );
+        assert!(!app.connected);
+        assert!(app.last_live.is_none());
+        assert!(app.snapshot.is_none(), "no state file: no fake data");
+    }
+
+    #[test]
+    fn completed_node_switch_reports_supersedes_and_forces_a_refresh() {
+        let mut app = app_for_order();
+        app.last_refresh = Instant::now();
+        // A status frame issued during the mutation carries the
+        // post-submission epoch; completion must still supersede it.
+        app.epoch = 5;
+        app.status_flight = Some(flight_for(None, "dev", 5));
+        let mut reply = control::Reply::ok();
+        reply.switch = Some(control::SwitchOutcome {
+            requested: "a".into(),
+            installed: "a".into(),
+            fallback: false,
+        });
+
+        complete_mutation(
+            &mut app,
+            flight_for(Some(MutationKind::NodeSwitch { node: "a".into() }), "dev", 5),
+            Ok(reply),
+        );
+        assert_eq!(app.message, "switched to a");
+        assert!(!app.busy());
+        assert_eq!(app.epoch, 6, "completion supersedes mid-mutation frames");
+        assert!(
+            app.status_flight.is_none(),
+            "the lane frees immediately for the forced refresh"
+        );
+        assert!(
+            app.last_refresh.elapsed() >= REFRESH_EVERY,
+            "post-mutation refresh is due immediately"
+        );
+    }
+
+    #[test]
+    fn a_successful_subscription_change_clears_the_filter() {
+        let mut app = app_for_order();
+        app.filter = Some("hk".into());
+        app.filter_edit = true;
+        let mut reply = control::Reply::ok();
+        reply.subscription_switch = Some(control::SubscriptionSwitchOutcome {
+            previous: "primary".into(),
+            active: "secondary".into(),
+            node_count: 7,
+            refreshed: false,
+        });
+
+        complete_mutation(
+            &mut app,
+            flight_for(
+                Some(MutationKind::SubscriptionSwitch {
+                    previous: "primary".into(),
+                    requested: "secondary".into(),
+                    generation_before: 0,
+                }),
+                "dev",
+                0,
+            ),
+            Ok(reply),
+        );
+        assert_eq!(app.filter, None, "a pool-wide change invalidates the filter");
+        assert!(!app.filter_edit);
+        assert!(app.message.contains("secondary"));
+    }
+
+    #[test]
+    fn recommendation_ignores_the_active_filter() {
+        let mut app = app_for_order();
+        let mut snap = tagged_snapshot("primary", 2, &["hk-2", "jp-1"]);
+        snap.nodes
+            .insert("hk-2".into(), stats(0.95, Some(40.0), true));
+        snap.nodes.insert("jp-1".into(), stats(0.90, Some(30.0), true));
+        let round = valid_probe_round(
+            probe_round_tag(&snap).unwrap(),
+            vec![
+                probe_result("hk-2", Some(20.0)),
+                probe_result("jp-1", Some(30.0)),
+            ],
+        );
+        app.snapshot = Some(snap.clone());
+        app.subs = snap.available_nodes.clone();
+        app.last_probe_round = Some(round);
+        app.filter = Some("jp".into());
+        rebuild_order(&mut app);
+        assert_eq!(app.order, ["jp-1"], "the visible view is filtered");
+        assert_eq!(
+            recommended_node(&app),
+            Some("hk-2"),
+            "the recommendation speaks about the whole pool"
+        );
+    }
+
+    #[test]
+    fn prepare_mutation_supersedes_in_flight_status_frames() {
+        let mut app = app_for_order();
+        app.status_flight = Some(flight_for(None, "dev", 4));
+        app.epoch = 4;
+
+        // The socket-free half of submit_mutation: the epoch bump is the
+        // line that makes pre-mutation frames stale on landing.
+        let flight = prepare_mutation(
+            &mut app,
+            MutationKind::NodeSwitch { node: "a".into() },
+            dropped_rx(),
+        );
+        assert_eq!(app.epoch, 5);
+        assert_eq!(flight.epoch, 5, "the flight carries the new epoch");
+        assert_eq!(flight.class, "dev");
+
+        let reply = control::Reply::ok_status(snapshot(BTreeMap::new()));
+        complete_status_reply(&mut app, flight_for(None, "dev", 4), Ok(reply));
+        assert!(
+            app.snapshot.is_none(),
+            "the pre-mutation status frame must not land"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_mutation_refuses_to_overlap_and_reports() {
+        let mut app = app_for_order();
+        let socket = PathBuf::from("/nonexistent-causeway-test.sock");
+        submit_mutation(&mut app, &socket, MutationKind::NodeSwitch { node: "a".into() });
+        assert!(app.busy());
+        let first_epoch = app.epoch;
+
+        submit_mutation(&mut app, &socket, MutationKind::NodeSwitch { node: "b".into() });
+        assert_eq!(app.epoch, first_epoch, "a refused overlap bumps nothing");
+        assert!(app.message.contains("already in progress"));
+    }
+
+    // ---- data age / STALE honesty ----
+
+    #[test]
+    fn staleness_thresholds_are_three_and_ten_cadences() {
+        assert_eq!(staleness(Some(REFRESH_EVERY * 3)), Staleness::Fresh);
+        assert_eq!(
+            staleness(Some(REFRESH_EVERY * 3 + Duration::from_millis(1))),
+            Staleness::Stale
+        );
+        assert_eq!(staleness(Some(REFRESH_EVERY * 10)), Staleness::Stale);
+        assert_eq!(
+            staleness(Some(REFRESH_EVERY * 10 + Duration::from_millis(1))),
+            Staleness::VeryStale
+        );
+        assert_eq!(staleness(None), Staleness::VeryStale);
+    }
+
+    fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn strip_title_flags_stale_live_data_and_offline_state_age() {
+        let mut app = app_for_order();
+        app.snapshot = Some(snapshot(BTreeMap::new()));
+        app.connected = true;
+        app.last_live = Some(Instant::now() - REFRESH_EVERY * 12);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let rendered = terminal_text(&terminal);
+        assert!(rendered.contains("STALE"), "{rendered}");
+
+        app.connected = false;
+        app.last_live = None;
+        app.state_updated_unix = Some(state::now_unix() - 3600);
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let rendered = terminal_text(&terminal);
+        assert!(rendered.contains("OFFLINE"), "{rendered}");
+        assert!(rendered.contains("old"), "state age is stated, not implied: {rendered}");
+    }
+
+    // ---- event feed coloring ----
+
+    #[test]
+    fn event_feed_colors_by_kind() {
+        assert_eq!(
+            event_color(&control::Event::Switched {
+                unix: 0,
+                class: "dev".into(),
+                node: "n".into(),
+                reason: "manual".into(),
+                generation: 1,
+            }),
+            tokens::OK
+        );
+        assert_eq!(
+            event_color(&control::Event::HealthFailed {
+                unix: 0,
+                class: "dev".into(),
+                node: "n".into(),
+                consecutive: 1,
+            }),
+            tokens::ERROR
+        );
+        assert_eq!(
+            event_color(&control::Event::Probed {
+                unix: 0,
+                source: "periodic".into(),
+                ok: 1,
+                total: 2,
+            }),
+            tokens::MUTED
+        );
+        assert_eq!(
+            event_color(&control::Event::SubscriptionChanged {
+                unix: 0,
+                previous: "a".into(),
+                active: "b".into(),
+                node_count: 3,
+                refreshed: false,
+            }),
+            tokens::ACCENT
+        );
+    }
+
+    // ---- filter / help / copy verbs ----
+
+    #[test]
+    fn filter_narrows_the_table_and_keeps_selection_identity() {
+        let mut app = app_for_order();
+        app.subs = vec!["jp-1".into(), "hk-2".into(), "sg-3".into()];
+        rebuild_order(&mut app);
+        assert_eq!(app.order.len(), 3);
+        app.selected = 1; // hk-2
+        app.filter = Some("HK".into()); // case-insensitive match
+        rebuild_order(&mut app);
+        assert_eq!(app.order, ["hk-2"]);
+        assert_eq!(app.order_full.len(), 3);
+        assert_eq!(app.order[app.selected], "hk-2");
+        app.filter = None;
+        rebuild_order(&mut app);
+        assert_eq!(app.order.len(), 3);
+    }
+
+    #[test]
+    fn filter_edit_keys_commit_and_clear() {
+        let mut app = app_for_order();
+        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        app.filter_edit = true;
+        for c in "hk".chars() {
+            filter_edit_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.filter.as_deref(), Some("hk"));
+        assert_eq!(app.order, ["hk-2"]);
+
+        filter_edit_key(&mut app, KeyCode::Enter);
+        assert!(!app.filter_edit);
+        assert_eq!(
+            app.filter.as_deref(),
+            Some("hk"),
+            "Enter commits, keeping the filter active"
+        );
+
+        app.filter_edit = true;
+        filter_edit_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.filter, None, "Esc clears the filter entirely");
+        rebuild_order(&mut app);
+        assert_eq!(app.order.len(), 2);
+    }
+
+    #[test]
+    fn footer_shows_the_live_filter_while_editing() {
+        let mut app = app_for_order();
+        app.filter_edit = true;
+        app.filter = Some("jp".into());
+        let (message, color) = footer_message(&app);
+        assert!(message.contains("filter: jp"));
+        assert_eq!(color, tokens::ACCENT);
+    }
+
+    #[test]
+    fn footer_hint_and_help_overlay_share_one_bindings_table() {
+        let hint = footer_keys_hint();
+        for (keys, _) in BINDINGS {
+            assert!(hint.contains(keys), "footer hint must list {keys}");
+        }
+
+        let mut app = app_for_order();
+        app.help_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let rendered = terminal_text(&terminal);
+        for (_, action) in BINDINGS {
+            assert!(
+                rendered.contains(action),
+                "help overlay must explain {action}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_export_line_targets_the_focused_gateway() {
+        let line = proxy_export_line("127.0.0.1:17878");
+        assert!(line.starts_with("export http_proxy=http://127.0.0.1:17878"));
+        assert!(line.contains("https_proxy=http://127.0.0.1:17878"));
+        assert!(line.contains("all_proxy=socks5h://127.0.0.1:17878"));
+    }
+
+    // ---- lane wiring: counts, starvation, overlap, closed-channel ----
+
+    #[tokio::test]
+    async fn both_lanes_spawn_on_the_same_due_tick() {
+        // The starvation bug this pins: a shared clock reset by the status
+        // spawn used to keep the events feed from EVER firing while the
+        // daemon answered status promptly.
+        let mut app = app_for_order();
+        app.connected = true;
+        app.last_refresh = Instant::now() - REFRESH_EVERY;
+        app.last_events_refresh = Instant::now() - REFRESH_EVERY;
+        let socket = PathBuf::from("/nonexistent-causeway-test.sock");
+        maybe_spawn_refresh(&mut app, &socket);
+        assert!(app.status_flight.is_some());
+        assert!(app.events_flight.is_some(), "events must not wait for status");
+        assert_eq!(app.status_spawns, 1);
+        assert_eq!(app.events_spawns, 1);
+
+        // Fresh clocks + occupied lanes: an immediate second pass spawns
+        // nothing more.
+        maybe_spawn_refresh(&mut app, &socket);
+        assert_eq!(app.status_spawns, 1);
+        assert_eq!(app.events_spawns, 1);
+    }
+
+    #[tokio::test]
+    async fn status_lane_counts_spawns_over_real_wiring() {
+        // Count-test discipline: drive the real poll/spawn wiring against a
+        // dead socket and assert request COUNTS, not just predicates. A
+        // per-tick poller or a stuck lane moves these numbers.
+        let mut app = app_for_order();
+        let socket = PathBuf::from("/nonexistent-causeway-test.sock");
+        for _ in 0..22 {
+            poll_flights(&mut app);
+            maybe_spawn_refresh(&mut app, &socket);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            (1..=3).contains(&app.status_spawns),
+            "2s cadence over a 2.2s window: expected ~2 spawns, got {}",
+            app.status_spawns
+        );
+        assert_eq!(app.events_spawns, 0, "never connected: events stay off");
+        assert!(!app.connected, "dead socket degrades to offline");
+    }
+
+    #[tokio::test]
+    async fn held_lane_never_overlaps_and_a_dropped_task_fails_closed() {
+        let mut app = app_for_order();
+        app.connected = true;
+        let (tx, rx) = oneshot::channel();
+        app.events_flight = Some(InFlight {
+            kind: None,
+            class: "dev".into(),
+            epoch: app.epoch,
+            rx,
+        });
+        app.last_events_refresh = Instant::now() - REFRESH_EVERY;
+        let socket = PathBuf::from("/nonexistent-causeway-test.sock");
+        maybe_spawn_refresh(&mut app, &socket);
+        assert_eq!(
+            app.events_spawns, 0,
+            "a held-open lane must not spawn a second request"
+        );
+
+        // The background task dying without answering (sender dropped
+        // unsent) must clear the lane and degrade like an error, not stick.
+        drop(tx);
+        let before: Vec<i64> = app.events.iter().map(|e| e.unix()).collect();
+        poll_flights(&mut app);
+        assert!(app.events_flight.is_none(), "a closed channel frees the lane");
+        let after: Vec<i64> = app.events.iter().map(|e| e.unix()).collect();
+        assert_eq!(after, before, "advisory data survives the failure");
+    }
+
+    // ---- key dispatch: one binding at a time ----
+
+    #[tokio::test]
+    async fn every_binding_row_has_a_working_handler() {
+        let socket = PathBuf::from("/nonexistent-causeway-test.sock");
+        let mut app = app_for_order();
+        app.cfg_classes = vec!["dev".into(), "browser".into()];
+        app.listens = vec!["127.0.0.1:17878".into(), "127.0.0.1:17880".into()];
+        app.class_selections = vec![String::new(), String::new()];
+        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        rebuild_order(&mut app);
+
+        // Tab/←/→ — class focus: state reset, epoch supersede, filter gone.
+        app.epoch = 7;
+        app.status_flight = Some(flight_for(None, "dev", 7));
+        app.filter = Some("hk".into());
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Tab), KeyAction::None);
+        assert_eq!(app.class(), "browser");
+        assert_eq!(app.epoch, 8);
+        assert!(app.status_flight.is_none(), "class change drops stale frames");
+        assert_eq!(app.filter, None, "a class-local filter does not carry over");
+        assert!(app.last_refresh.elapsed() >= REFRESH_EVERY);
+
+        // k/j move the selection (no snapshot: plain name order).
+        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        rebuild_order(&mut app);
+        assert_eq!(app.order, ["hk-2", "jp-1"]);
+        app.selected = 0;
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('j')), KeyAction::None);
+        assert_eq!(app.order[app.selected], "jp-1");
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('k')), KeyAction::None);
+        assert_eq!(app.order[app.selected], "hk-2");
+
+        // t submits an end-to-end probe on the mutation lane.
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('t')), KeyAction::None);
+        assert!(app.busy());
+        app.mutation_flight = None; // simulate completion for the next rows
+
+        // s opens the subscription picker.
+        app.fallback_subscriptions = vec![control::SubscriptionSummary {
+            name: "primary".into(),
+            node_count: Some(1),
+        }];
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('s')), KeyAction::None);
+        assert!(app.subscription_picker.is_some());
+        app.subscription_picker = None;
+
+        // Enter submits a node switch on the mutation lane.
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Enter), KeyAction::None);
+        assert!(app.busy());
+
+        // q during a mutation arms instead of quitting; the second press quits.
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('q')), KeyAction::None);
+        assert!(app.quit_armed);
+        assert!(app.message.contains("change in flight"));
+        // 'c' must not clobber the busy message while armed.
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('c')), KeyAction::None);
+        assert!(app.message.contains("change in flight"), "c stays quiet while busy");
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('q')), KeyAction::Quit);
+
+        // With no mutation in flight: c, ?, /, s all act.
+        app.mutation_flight = None;
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('c')), KeyAction::None);
+        assert!(app.message.contains("export http_proxy="));
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('?')), KeyAction::None);
+        assert!(app.help_open);
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('/')), KeyAction::None);
+        assert!(app.filter_edit);
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Esc), KeyAction::Quit);
+    }
+
+    #[tokio::test]
+    async fn class_switching_is_blocked_while_a_mutation_runs() {
+        let mut app = app_for_order();
+        app.cfg_classes = vec!["dev".into(), "browser".into()];
+        app.listens = vec!["127.0.0.1:17878".into(), "127.0.0.1:17880".into()];
+        let socket = PathBuf::from("/nonexistent-causeway-test.sock");
+        app.subs = vec!["a".into()];
+        rebuild_order(&mut app);
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Enter), KeyAction::None);
+        assert!(app.busy());
+        assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Tab), KeyAction::None);
+        assert_eq!(app.class(), "dev", "the class guard keeps the outcome observable");
+    }
+
+    // ---- render-level pins ----
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).unwrap().symbol())
+            .collect()
+    }
+
+    fn row_has_fg(buffer: &ratatui::buffer::Buffer, y: u16, color: Color) -> bool {
+        (0..buffer.area.width).any(|x| {
+            buffer.cell((x, y)).unwrap().style().fg == Some(color)
+        })
+    }
+
+    #[test]
+    fn event_feed_colors_reach_the_screen() {
+        let mut app = app_for_order();
+        let now = state::now_unix();
+        app.events = vec![
+            control::Event::Switched {
+                unix: now,
+                class: "dev".into(),
+                node: "n".into(),
+                reason: "manual".into(),
+                generation: 1,
+            },
+            control::Event::HealthFailed {
+                unix: now,
+                class: "dev".into(),
+                node: "n".into(),
+                consecutive: 1,
+            },
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut switched_checked = false;
+        let mut health_checked = false;
+        for y in 0..buffer.area.height {
+            let text = row_text(buffer, y);
+            if text.contains("→ n (manual") {
+                assert!(
+                    row_has_fg(buffer, y, tokens::OK),
+                    "a switched event must render green: {text}"
+                );
+                switched_checked = true;
+            }
+            if text.contains("health check failed") {
+                assert!(
+                    row_has_fg(buffer, y, tokens::ERROR),
+                    "a health failure must render red: {text}"
+                );
+                health_checked = true;
+            }
+        }
+        assert!(switched_checked, "feed row rendered");
+        assert!(health_checked, "health row rendered");
+    }
+
+    #[test]
+    fn strip_renders_selection_policy_and_stale_bands_and_filtered_title() {
+        let mut app = app_for_order();
+        let mut snap = snapshot(BTreeMap::new());
+        snap.classes = vec![control::ClassOverview {
+            name: "dev".into(),
+            listen: "127.0.0.1:17878".into(),
+            active_node: Some("hk01".into()),
+            generation: 3,
+            selection: "regions=HK auto=off".into(),
+        }];
+        app.snapshot = Some(snap);
+        app.connected = true;
+
+        // Yellow band (between 3x and 10x cadence).
+        app.last_live = Some(Instant::now() - REFRESH_EVERY * 4);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let rendered = terminal_text(&terminal);
+        assert!(rendered.contains("STALE"), "yellow band shows STALE: {rendered}");
+        assert!(
+            rendered.contains("regions=HK"),
+            "daemon-supplied selection policy is visible: {rendered}"
+        );
+
+        // Filtered title with an honest narrowed/total count.
+        app.last_live = Some(Instant::now());
+        app.filter = Some("hk".into());
+        app.order = vec!["hk-2".into()];
+        app.order_full = vec!["hk-2".into(), "jp-1".into(), "sg-3".into()];
+        terminal.draw(|f| ui(f, &app)).unwrap();
+        let rendered = terminal_text(&terminal);
+        assert!(
+            rendered.contains("filtered 1/3"),
+            "filter count in the table title: {rendered}"
+        );
+    }
+
+    #[test]
+    fn class_strip_columns_fit_their_budget() {
+        for width in 40u16..=160 {
+            let columns = class_strip_column_lengths(width);
+            let sum: u16 = columns.iter().sum();
+            assert!(
+                sum + 8 <= width,
+                "{width}-column strip uses {sum}+8 columns"
+            );
+        }
+        // SELECTION is the sacrificial column: it shrinks before NODE does.
+        assert!(class_strip_column_lengths(60)[3] < class_strip_column_lengths(100)[3]);
+        assert!(class_strip_column_lengths(100)[2] >= 10, "NODE keeps a floor");
+    }
+
+    #[test]
+    fn rebuild_order_clamps_selection_when_the_filter_hides_it() {
+        let mut app = app_for_order();
+        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        rebuild_order(&mut app);
+        app.selected = 1; // hk-2
+        app.filter = Some("jp".into());
+        rebuild_order(&mut app);
+        assert_eq!(app.order, ["jp-1"]);
+        assert_eq!(
+            app.order[app.selected], "jp-1",
+            "selection clamps into the filtered view"
+        );
+    }
+
+    // ---- module boundary ----
+
+    #[test]
+    fn ui_module_imports_only_the_control_protocol_surface() {
+        // Allowlist, not denylist: every `crate::<ident>` path root used by
+        // the dashboard must be one of the sanctioned surfaces (control
+        // protocol, persistence, config, subscription catalog, scoring, and
+        // the two shared main.rs helpers). A new engine module referenced
+        // here fails this test by construction.
+        let src = include_str!("switch.rs");
+        let allowed = [
+            "config", "control", "score", "state", "subscription", "truncate", "cmd_status",
+        ];
+        let mut roots = std::collections::BTreeSet::new();
+        let mut rest = src;
+        while let Some(pos) = rest.find("crate::") {
+            rest = &rest[pos + "crate::".len()..];
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() {
+                roots.insert(ident);
+            }
+        }
+        for root in &roots {
+            assert!(
+                allowed.contains(&root.as_str()),
+                "switch.rs must not reach crate::{root}; the UI talks to the engine only through the control protocol"
+            );
+        }
+        // The sanctioned surface must stay in use, or the allowlist rots.
+        for expected in allowed {
+            assert!(
+                roots.contains(expected),
+                "expected sanctioned import crate::{expected} not found — allowlist is stale"
+            );
+        }
+    }
+
+    // ---- single color source ----
+
+    #[test]
+    fn tokens_keep_the_original_palette() {
+        // The palette values are pinned exactly once, here; everywhere else
+        // asks tokens by meaning.
+        assert_eq!(tokens::OK, Color::Green);
+        assert_eq!(tokens::WARN, Color::Yellow);
+        assert_eq!(tokens::ERROR, Color::Red);
+        assert_eq!(tokens::MUTED, Color::DarkGray);
+        assert_eq!(tokens::ACCENT, Color::Cyan);
+    }
+
+    #[test]
+    fn raw_palette_literals_live_only_in_tokens() {
+        let src = include_str!("switch.rs");
+        for name in ["Green", "Yellow", "Red", "DarkGray", "Cyan"] {
+            let needle = format!("Color::{name}");
+            let count = src.matches(&needle).count();
+            assert_eq!(
+                count, 2,
+                "{needle} must appear exactly twice: the tokens definition and the palette pin"
+            );
+        }
     }
 }

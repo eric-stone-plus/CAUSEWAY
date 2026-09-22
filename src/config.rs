@@ -100,6 +100,32 @@ pub const LEGACY_SUBSCRIPTION_NAME: &str = "default";
 pub struct ClassConfig {
     /// Loopback listen address for this class, e.g. 127.0.0.1:17878
     pub listen: SocketAddr,
+    /// Per-class override of the global [selection] policy. Only the keys set
+    /// here take effect for this class; the rest inherit [selection]. This is
+    /// how one class is pinned to a subset of the shared node pool without
+    /// forking the subscription into a second live pool. Caveat: subscription
+    /// refreshes stage every class before committing, so an override whose
+    /// allowlist matches zero pool nodes fails the refresh for ALL classes
+    /// (old paths keep serving; fix or drop the override to refresh).
+    #[serde(default)]
+    pub selection: Option<ClassSelection>,
+}
+
+/// Keys of [selection] that a single class may override. Both are optional:
+/// `None` inherits the global value.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct ClassSelection {
+    /// Replacement region allowlist for AUTOMATIC selection on this class
+    /// (initial activation, health-failure recovery, challenger-wins). Manual
+    /// switching via the control socket stays unrestricted. An empty vec is
+    /// rejected at validation — omit the key to inherit.
+    #[serde(default)]
+    pub regions: Option<Vec<String>>,
+    /// Replacement auto_switch flag for this class: when false, a working
+    /// active node never moves on its own (health-failure recovery and
+    /// challenger-wins only log).
+    #[serde(default)]
+    pub auto_switch: Option<bool>,
 }
 
 /// Static destination routing compiled into each supervised data plane.
@@ -398,6 +424,42 @@ impl Config {
         }
     }
 
+    /// Effective region allowlist for automatic selection on `class`: the
+    /// per-class override when set, else the global [selection] value.
+    pub fn class_regions(&self, class: &str) -> &[String] {
+        self.classes
+            .get(class)
+            .and_then(|c| c.selection.as_ref())
+            .and_then(|s| s.regions.as_deref())
+            .unwrap_or(&self.selection.regions)
+    }
+
+    /// Effective auto_switch flag for `class`: per-class override when set,
+    /// else the global [selection] value.
+    pub fn class_auto_switch(&self, class: &str) -> bool {
+        self.classes
+            .get(class)
+            .and_then(|c| c.selection.as_ref())
+            .and_then(|s| s.auto_switch)
+            .unwrap_or(self.selection.auto_switch)
+    }
+
+    /// Compact per-class policy summary for the dashboard strip, e.g.
+    /// "regions=hk,jp auto=off". Empty = inherits global [selection].
+    pub fn class_selection_summary(&self, class: &str) -> String {
+        let Some(sel) = self.classes.get(class).and_then(|c| c.selection.as_ref()) else {
+            return String::new();
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(regions) = &sel.regions {
+            parts.push(format!("regions={}", regions.join(",")));
+        }
+        if let Some(auto) = sel.auto_switch {
+            parts.push(format!("auto={}", if auto { "on" } else { "off" }));
+        }
+        parts.join(" ")
+    }
+
     /// Hard validation (errors refuse startup); environment problems (missing
     /// files etc.) go to `warnings`.
     #[cfg(test)]
@@ -425,6 +487,13 @@ impl Config {
                     "classes {other:?} and {name:?} share listen address {}",
                     class.listen
                 );
+            }
+            if let Some(sel) = &class.selection {
+                if sel.regions.as_ref().is_some_and(|r| r.is_empty()) {
+                    bail!(
+                        "classes.{name}.selection.regions is empty — omit the key to inherit [selection].regions"
+                    );
+                }
             }
         }
         self.routing.validate()?;
@@ -1168,6 +1237,60 @@ listen = "127.0.0.1:17878"
             home.join(".local/share/causeway/bin/sing-box"),
             "sing-box default path"
         );
+    }
+
+    #[test]
+    fn class_selection_overrides_inherit_unset_keys() {
+        let text = r#"
+[subscriptions]
+files = ["~/sub.yaml"]
+
+[selection]
+regions = ["Japan"]
+auto_switch = true
+
+[classes.dev]
+listen = "127.0.0.1:17878"
+
+[classes.telegram]
+listen = "127.0.0.1:17885"
+
+[classes.telegram.selection]
+regions = ["🇭🇰", "香港"]
+auto_switch = false
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        // Unset override inherits the global policy.
+        assert_eq!(cfg.class_regions("dev"), &["Japan".to_string()]);
+        assert!(cfg.class_auto_switch("dev"));
+        assert_eq!(cfg.class_selection_summary("dev"), "");
+        // Set override replaces only the keys it sets.
+        assert_eq!(cfg.class_regions("telegram"), &["🇭🇰".to_string(), "香港".to_string()]);
+        assert!(!cfg.class_auto_switch("telegram"));
+        assert_eq!(
+            cfg.class_selection_summary("telegram"),
+            "regions=🇭🇰,香港 auto=off"
+        );
+        // Unknown class inherits global policy rather than failing.
+        assert_eq!(cfg.class_regions("nope"), &["Japan".to_string()]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn class_selection_rejects_empty_regions() {
+        let text = r#"
+[subscriptions]
+files = ["~/sub.yaml"]
+
+[classes.dev]
+listen = "127.0.0.1:17878"
+
+[classes.dev.selection]
+regions = []
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("dev.selection.regions is empty"), "{error}");
     }
 
     #[test]

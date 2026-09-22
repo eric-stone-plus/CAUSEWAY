@@ -73,6 +73,19 @@ listen = "127.0.0.1:17878"      # development traffic
 [classes.market]
 listen = "127.0.0.1:17879"      # market-data traffic
 
+# Optional per-class override of the global [selection] policy (commented
+# example below). Only the keys set here take effect for this class; the
+# rest inherit [selection]. `regions` replaces the automatic-selection
+# allowlist for this class only (manual switching via `causeway switch`
+# stays unrestricted); `auto_switch = false` pins a working active node so
+# health-failure recovery and challenger-wins only log. Caveat: subscription
+# refreshes stage every class before committing, so an allowlist matching
+# zero pool nodes fails the refresh for all classes (old paths keep
+# serving; fix or drop the override to refresh).
+# [classes.market.selection]
+# regions = ["HK"]               # omit to inherit [selection].regions
+# auto_switch = false            # omit to inherit [selection].auto_switch
+
 [probe]
 interval_secs = 600            # periodic re-probe interval (default 10 minutes)
 timeout_ms = 3000              # per-probe TCP connect timeout

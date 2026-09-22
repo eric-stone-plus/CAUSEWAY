@@ -417,9 +417,13 @@ fn cmd_status(cfg: &config::Config) -> anyhow::Result<()> {
         );
         return Ok(());
     };
+    // Source and age first: this tier reads only the persisted state file
+    // (it works while the daemon is down), so the data's vintage is stated
+    // rather than implied.
     pln!(
-        "state file: {} (updated_unix={})",
+        "source: state file {} · saved {} ago (unix={})",
         cfg.state_file.display(),
+        state::human_age(st.updated_unix, state::now_unix()),
         st.updated_unix
     );
 

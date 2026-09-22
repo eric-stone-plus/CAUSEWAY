@@ -54,7 +54,14 @@ cargo clippy           # before committing (not a hard gate)
   one-shot client used by `causeway switch`.
 - `src/switch.rs` — nmtui-style interactive node switcher (ratatui +
   crossterm) with an always-visible class strip; plain status report when
-  stdout is not a terminal.
+  stdout is not a terminal. Async refresh spine: every daemon request
+  (cadence refreshes and mutations) runs on a background task polled each
+  tick, one request per lane (status/events/mutation, never overlapping),
+  superseded replies discarded by epoch; `/` filter, `c` proxy exports,
+  `?` help overlay derived from the single BINDINGS table; data age/STALE
+  honesty in the strip title and footer. The UI reaches the engine only
+  through the control protocol plus state/config/subscription/score —
+  pinned by `ui_module_imports_only_the_control_protocol_surface`.
 - `src/config.rs` — TOML loading, `~` expansion, hard validation.
 - `src/subscription.rs` — offline endpoint-manifest parsing, per-entry fault
   tolerance; unsupported entry types are rejected explicitly at parse time.
