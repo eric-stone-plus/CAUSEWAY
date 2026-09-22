@@ -610,7 +610,7 @@ async fn switch_node_locked(ctx: &Arc<Ctx>, rt: &mut ClassRuntime, reason: &str)
     let (candidates, current_node): (Vec<Node>, Option<Node>) = {
         let pool = pool(ctx);
         let st = lock_state(&ctx.state);
-        let candidates = ranked_candidates(&pool, &st, &ctx.cfg.selection.regions)
+        let candidates = ranked_candidates(&pool, &st, ctx.cfg.class_regions(&rt.name))
             .into_iter()
             .filter(|n| Some(n.name()) != current.as_deref())
             .take(MAX_SWITCH_CANDIDATES)
@@ -662,11 +662,11 @@ async fn recover_after_health_failure(
     class: &Arc<tokio::sync::Mutex<ClassRuntime>>,
 ) {
     let mut rt = class.lock().await;
-    if rt.active.is_some() && !ctx.cfg.selection.auto_switch {
+    if rt.active.is_some() && !ctx.cfg.class_auto_switch(&rt.name) {
         warn!(
             class = %rt.name,
             node = %rt.active.as_ref().map(|a| a.node.name()).unwrap_or_default(),
-            "automatic node switching is disabled (selection.auto_switch = false); staying on the active node"
+            "automatic node switching is disabled for this class (selection.auto_switch = false); staying on the active node"
         );
         return;
     }
@@ -992,8 +992,10 @@ async fn switch_subscription_locked(
         // A subscription switch (not a refresh) must bypass the region
         // allowlist: the new profile's node naming convention may not match
         // the operator's region filter designed for the incumbent profile.
+        // A refresh re-picks within the class's effective allowlist, so a
+        // per-class [classes.<name>.selection] override keeps applying.
         let effective_regions: &[String] = if refreshed {
-            &ctx.cfg.selection.regions
+            ctx.cfg.class_regions(&class_name)
         } else {
             &[]
         };
@@ -1281,6 +1283,7 @@ fn class_snapshot(ctx: &Ctx, class: &str) -> Option<control::StatusSnapshot> {
                     listen: class_cfg.listen.to_string(),
                     active_node: st.classes.get(name).and_then(|c| c.active_node.clone()),
                     generation: st.classes.get(name).map(|c| c.generation).unwrap_or(0),
+                    selection: ctx.cfg.class_selection_summary(name),
                 })
                 .collect();
             (cs, st.nodes.clone(), classes)
@@ -1860,7 +1863,7 @@ async fn activate_initial(ctx: &Arc<Ctx>, class: &Arc<tokio::sync::Mutex<ClassRu
             &pool,
             Some(&st.nodes),
             preferred.as_deref(),
-            &ctx.cfg.selection.regions,
+            ctx.cfg.class_regions(&rt.name),
         )
     };
 
@@ -1997,7 +2000,7 @@ async fn probe_loop(
                 };
                 let pool = pool(&ctx);
                 let st = lock_state(&ctx.state);
-                let best = ranked_candidates(&pool, &st, &ctx.cfg.selection.regions)
+                let best = ranked_candidates(&pool, &st, ctx.cfg.class_regions(&rt.name))
                     .into_iter()
                     .find(|n| n.name() != current)
                     .map(|n| n.name().to_string());
@@ -2006,7 +2009,7 @@ async fn probe_loop(
             let Some(challenger) = challenger else {
                 continue;
             };
-            if !ctx.cfg.selection.auto_switch {
+            if !ctx.cfg.class_auto_switch(&class_name) {
                 // Pinned mode: probe results refresh scores only; the active
                 // node never moves without operator action.
                 continue;

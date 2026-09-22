@@ -90,8 +90,13 @@ CLI: `causeway run | probe | status | config check | switch`; bare
 `causeway` opens the dashboard TUI — an always-visible class strip (every
 listener and its active node), a quality-ranked node table for the focused
 class with per-node traffic columns, events feed, `s` subscription picker,
-`t` end-to-end test of all nodes, and Tab to cycle classes so Enter switches
-only that class (plain table when piped) — see `--help` for details. Logs:
+`t` end-to-end test of all nodes, `/` node-table filter, `c` paste-ready
+proxy exports, `?` key help, and Tab to cycle classes so Enter switches
+only that class (plain table when piped) — see `--help` for details. After
+startup the dashboard never blocks on the daemon: requests run on background
+tasks with one per lane, superseded replies are discarded, and data age is
+shown honestly (STALE past the refresh cadence; quitting during an
+in-flight change asks for a second keypress). Logs:
 `journalctl --user -u causeway -f`.
 
 ### Site freeze awareness (anti-bot)

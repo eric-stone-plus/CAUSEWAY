@@ -366,6 +366,27 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Coarse human age (3s, 42m, 1h05m, 3d2h) for the display tiers. Clamps at
+/// zero: a clock skew or a future timestamp must never render as a negative
+/// age.
+pub fn human_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
+    }
+}
+
+/// Age of a unix timestamp as displayed by the status tiers.
+pub fn human_age(unix: i64, now: i64) -> String {
+    human_duration(now.saturating_sub(unix))
+}
+
 fn json_error(path: &Path, source: serde_json::Error) -> StateError {
     StateError::Json {
         path: path.to_path_buf(),
@@ -562,6 +583,20 @@ mod tests {
             probe_count: 7,
             last_probe_unix: Some(12300),
         }
+    }
+
+    #[test]
+    fn human_duration_covers_the_display_tiers_and_clamps_negative_age() {
+        assert_eq!(human_duration(0), "0s");
+        assert_eq!(human_duration(59), "59s");
+        assert_eq!(human_duration(60), "1m");
+        assert_eq!(human_duration(2_520), "42m");
+        assert_eq!(human_duration(3_900), "1h05m");
+        assert_eq!(human_duration(266_400), "3d2h");
+        // Clock skew: a future save timestamp must not print a negative age.
+        assert_eq!(human_duration(-7), "0s");
+        assert_eq!(human_age(10_000, 9_997), "0s");
+        assert_eq!(human_age(10_000, 10_003), "3s");
     }
 
     #[test]

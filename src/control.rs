@@ -325,6 +325,11 @@ pub struct ClassOverview {
     pub listen: String,
     pub active_node: Option<String>,
     pub generation: u64,
+    /// Compact per-class selection policy (e.g. "regions=🇭🇰,日本 auto=off");
+    /// empty means the class inherits the global [selection]. Defaulted so a
+    /// strip from an older daemon still decodes.
+    #[serde(default)]
+    pub selection: String,
 }
 
 /// Cumulative byte counts for one node.
@@ -897,6 +902,7 @@ mod tests {
                 listen: "127.0.0.1:17878".into(),
                 active_node: Some("hk01".into()),
                 generation: 3,
+                selection: "regions=HK auto=off".into(),
             }],
         };
         let status = roundtrip(&Reply::ok_status(snap)).status.unwrap();
@@ -907,6 +913,10 @@ mod tests {
         assert_eq!(status.available_nodes, ["hk01"]);
         assert_eq!(status.classes.len(), 1);
         assert_eq!(status.classes[0].listen, "127.0.0.1:17878");
+        assert_eq!(
+            status.classes[0].selection, "regions=HK auto=off",
+            "a populated per-class policy survives the wire"
+        );
 
         let probed = vec![ProbeResult {
             node: "hk01".into(),
