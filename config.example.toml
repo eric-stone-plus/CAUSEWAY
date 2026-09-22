@@ -85,6 +85,22 @@ listen = "127.0.0.1:17879"      # market-data traffic
 # [classes.market.selection]
 # regions = ["HK"]               # omit to inherit [selection].regions
 # auto_switch = false            # omit to inherit [selection].auto_switch
+#
+# Optional per-class health target: the class's health loop, candidate
+# pre-checks, and on-demand end-to-end probes all consult it instead of the
+# global [health].url. Use this when a class's traffic needs one specific
+# destination to actually work: `http://` targets are judged by a plaintext
+# GET (2xx = healthy), `connect://host[:port]` targets by whether an HTTP
+# CONNECT tunnel can be established (2xx = reachable) — the right shape for
+# services whose plaintext HTTP answers never read 2xx. Caveat: a 2xx proves
+# the egress path accepted the tunnel, not that the origin answered; an
+# egress that accepts every CONNECT optimistically will read permanently
+# healthy. Verdicts against a class-specific target deliberately never
+# write the shared per-node scores: they describe one destination, not the
+# node's generic fitness (the class's automatic ranking keeps using the
+# generic scores; its recovery streak is per-session, in-memory).
+# [classes.market.health]
+# url = "connect://api.example.com:443"
 
 [probe]
 interval_secs = 600            # periodic re-probe interval (default 10 minutes)

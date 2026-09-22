@@ -62,6 +62,11 @@ cargo clippy           # before committing (not a hard gate)
   honesty in the strip title and footer. The UI reaches the engine only
   through the control protocol plus state/config/subscription/score —
   pinned by `ui_module_imports_only_the_control_protocol_surface`.
+- `src/health.rs` + `src/config.rs` per-class health targets
+  (`[classes.<name>.health]`): plaintext GET or `connect://` reachability,
+  class-local failure streak, override verdicts never write shared scores.
+  The effective target per class is visible via `causeway config check`
+  only (the TUI does not surface it yet).
 - `src/config.rs` — TOML loading, `~` expansion, hard validation.
 - `src/subscription.rs` — offline endpoint-manifest parsing, per-entry fault
   tolerance; unsupported entry types are rejected explicitly at parse time.

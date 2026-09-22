@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::config::{SubscriptionProfileConfig, LEGACY_SUBSCRIPTION_NAME};
@@ -30,6 +30,9 @@ struct FakeTrace {
     starts: Mutex<Vec<String>>,
     stops: Mutex<Vec<String>>,
     drops: Mutex<Vec<String>>,
+    /// First request line seen by each fake data plane, in start order —
+    /// pins the health check's wire shape (GET vs CONNECT) per class.
+    requests: Mutex<Vec<String>>,
     next_handle: AtomicU64,
 }
 
@@ -40,6 +43,10 @@ impl FakeTrace {
 
     fn stops(&self) -> Vec<String> {
         self.stops.lock().unwrap().clone()
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -148,9 +155,40 @@ impl DataPlane for FakePlane {
         // spawning. The fake mirrors that boundary before binding its
         // loopback-only health responder.
         drop(spec);
-        let listener = tokio::net::TcpListener::bind(http_addr).await?;
+        // Loopback port release→rebind has a small TOCTOU window (the
+        // reservation is dropped just above, mirroring the real adapter
+        // boundary); retry transient EADDRINUSE instead of failing the test.
+        let listener = {
+            let mut last_err = None;
+            let mut bound = None;
+            for _ in 0..10 {
+                match tokio::net::TcpListener::bind(http_addr).await {
+                    Ok(l) => {
+                        bound = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        last_err = Some(e);
+                    }
+                }
+            }
+            bound.ok_or_else(|| anyhow::anyhow!("bind fake plane {http_addr}: {:?}", last_err))?
+        };
+        let trace = Arc::clone(&self.trace);
         let server = tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
+                // Record the request line so tests can assert which health
+                // target shape (GET vs CONNECT) actually reached the plane.
+                let mut buf = [0u8; 512];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    if let Some(pos) = buf[..n].iter().position(|b| *b == b'\n') {
+                        let line = String::from_utf8_lossy(&buf[..pos])
+                            .trim_end_matches('\r')
+                            .to_string();
+                        trace.requests.lock().unwrap().push(line);
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 );
@@ -167,6 +205,20 @@ impl DataPlane for FakePlane {
             trace: Arc::clone(&self.trace),
         }))
     }
+}
+
+/// Install a per-class health override on a fixture config (the config is
+/// behind an Arc, so this only works before the runtime spawns).
+fn install_class_health_override(ctx: &mut Arc<Ctx>, class: &str, url: &str) {
+    Arc::get_mut(ctx)
+        .unwrap()
+        .cfg
+        .classes
+        .get_mut(class)
+        .unwrap()
+        .health = Some(crate::config::ClassHealth {
+        url: Some(url.to_string()),
+    });
 }
 
 fn node(name: &str) -> Node {
@@ -308,6 +360,7 @@ fn recovery_fixture(
             path_connections: incumbent_connections,
         }),
         auto_recovery: AutoRecoveryBackoff::default(),
+        health_failures: 0,
     }));
     let (drain_shutdown, _) = watch::channel(false);
     let ctx = Arc::new(Ctx {
@@ -1205,7 +1258,7 @@ async fn on_demand_probe_skips_nodes_from_a_replaced_pool() {
         .read()
         .unwrap_or_else(|error| error.into_inner())
         .generation;
-    let result = probe_now_node(&ctx, node("current"), era).await;
+    let result = probe_now_node(&ctx, node("current"), era, &ctx.cfg.health.url, true).await;
     assert!(result.ok);
     assert!(lock_state(&ctx.state).nodes["current"].probe_count >= 1);
 
@@ -1217,7 +1270,7 @@ async fn on_demand_probe_skips_nodes_from_a_replaced_pool() {
         .unwrap_or_else(|error| error.into_inner())
         .generation += 1;
     let before = lock_state(&ctx.state).nodes["current"].clone();
-    let result = probe_now_node(&ctx, node("current"), era).await;
+    let result = probe_now_node(&ctx, node("current"), era, &ctx.cfg.health.url, true).await;
     assert!(!result.ok);
     assert_eq!(
         result.error.as_deref(),
@@ -1690,6 +1743,244 @@ async fn pinned_mode_without_active_node_still_activates() {
     );
     stop_draining(&ctx).await;
     std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn health_streak_is_class_local_when_classes_share_a_node() {
+    // Two classes share the active node (the default topology: every class
+    // ranks the same pool). With per-class health targets their verdicts
+    // diverge; the dev class's failure streak must survive the browser
+    // class's ok on the same node, or the recovery threshold is
+    // unreachable — the exact suppression shape of the 2026-09-22
+    // incident.
+    let (ctx, _class, _trace, dir) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [],
+        1,
+        0,
+        "class-local-streak",
+    );
+    let mut dev = tokio::sync::Mutex::new(ClassRuntime {
+        name: "dev".into(),
+        listen_addr: "127.0.0.1:17878".parse().unwrap(),
+        route: Arc::new(RwLock::new(ClassRoute::default())),
+        active: None,
+        auto_recovery: AutoRecoveryBackoff::default(),
+        health_failures: 0,
+    });
+    let shared = node("current");
+    let incumbent = ActiveNode {
+        node: shared.clone(),
+        handle: Box::new(FakeHandle::incumbent("incumbent-dev", Arc::new(FakeTrace::default()))),
+        path_connections: Arc::new(AtomicU64::new(0)),
+    };
+    dev.get_mut().active = Some(incumbent);
+    let mut browser = tokio::sync::Mutex::new(ClassRuntime {
+        name: "browser".into(),
+        listen_addr: "127.0.0.1:17880".parse().unwrap(),
+        route: Arc::new(RwLock::new(ClassRoute::default())),
+        active: Some(ActiveNode {
+            node: shared,
+            handle: Box::new(FakeHandle::incumbent("incumbent-browser", Arc::new(FakeTrace::default()))),
+            path_connections: Arc::new(AtomicU64::new(0)),
+        }),
+        auto_recovery: AutoRecoveryBackoff::default(),
+        health_failures: 0,
+    });
+
+    let (streak, has_active) = record_health_outcome(&ctx, dev.get_mut(), false);
+    assert!((streak, has_active) == (1, true));
+    // The other class's ok resets only the shared DISPLAY counter.
+    let (ok_streak, _) = record_health_outcome(&ctx, browser.get_mut(), true);
+    assert_eq!(ok_streak, 0);
+    let display = lock_state(&ctx.state)
+        .nodes
+        .get("current")
+        .unwrap()
+        .consecutive_health_failures;
+    assert_eq!(display, 0, "shared display counter follows the last verdict");
+    // dev's streak survives the reset and keeps climbing.
+    let (streak, _) = record_health_outcome(&ctx, dev.get_mut(), false);
+    assert_eq!(streak, 2, "the class-local streak is not reset by another class");
+    // A class ok clears its own streak.
+    let (streak, _) = record_health_outcome(&ctx, dev.get_mut(), true);
+    assert_eq!(streak, 0);
+    // No active path: the caller establishes one immediately.
+    dev.get_mut().active = None;
+    let (streak, has_active) = record_health_outcome(&ctx, dev.get_mut(), false);
+    assert!(!has_active);
+    assert_eq!(streak, ctx.cfg.health.fail_threshold);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn class_target_precheck_failures_never_touch_the_shared_scores() {
+    // The try_candidates gate mirrors the probe-path rule: a candidate that
+    // fails a pre-check judged against a class-specific target must not
+    // write a probe failure into the shared scores.
+    let (ctx, class, _trace, dir) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [("alternate", 503)],
+        1,
+        0,
+        "trycand-override-gate",
+    );
+    let mut ctx = ctx;
+    install_class_health_override(&mut ctx, "dev", "connect://api.example:443");
+    let before = lock_state(&ctx.state)
+        .nodes
+        .get("alternate")
+        .unwrap()
+        .probe_count;
+
+    let mut rt = class.lock().await;
+    let installed =
+        try_candidates(&ctx, &mut rt, &[node("alternate")], "test").await;
+    assert_eq!(installed, None, "the 503 pre-check fails the candidate");
+    drop(rt);
+    let after = lock_state(&ctx.state)
+        .nodes
+        .get("alternate")
+        .unwrap()
+        .probe_count;
+    assert_eq!(
+        after, before,
+        "an override class's pre-check failure must not write shared scores"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn class_target_probe_verdicts_never_touch_the_shared_scores() {
+    // The on-demand probe still REPORTS per-node verdicts against the class
+    // target, but with an override active those verdicts must not write the
+    // shared per-node EMAs — one destination's opinion must not steer every
+    // class's automatic ranking.
+    let (ctx, _class, _trace, dir) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [("current", 503), ("alternate", 204)],
+        1,
+        0,
+        "class-target-no-ema",
+    );
+    let mut ctx = ctx;
+    install_class_health_override(&mut ctx, "dev", "connect://api.example:443");
+    let before: Vec<(f64, u64)> = {
+        let st = lock_state(&ctx.state);
+        ["current", "alternate"]
+            .iter()
+            .map(|n| {
+                let s = st.nodes.get(*n).unwrap();
+                (s.success_ema, s.probe_count)
+            })
+            .collect()
+    };
+
+    let results = probe_now(&ctx, "dev").await;
+    assert_eq!(
+        results.iter().map(|r| r.ok).collect::<Vec<_>>(),
+        vec![false, true],
+        "verdicts are still reported per node"
+    );
+    let after: Vec<(f64, u64)> = {
+        let st = lock_state(&ctx.state);
+        ["current", "alternate"]
+            .iter()
+            .map(|n| {
+                let s = st.nodes.get(*n).unwrap();
+                (s.success_ema, s.probe_count)
+            })
+            .collect()
+    };
+    assert_eq!(before, after, "an override class never writes shared EMAs");
+
+    // Without an override the same flow records (legacy behavior).
+    let (ctx2, _c2, _t2, dir2) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [("current", 503), ("alternate", 204)],
+        1,
+        0,
+        "global-target-records",
+    );
+    let before2 = lock_state(&ctx2.state).nodes.get("current").unwrap().probe_count;
+    probe_now(&ctx2, "dev").await;
+    let after2 = lock_state(&ctx2.state).nodes.get("current").unwrap().probe_count;
+    assert!(after2 > before2, "the global target keeps recording");
+
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::remove_dir_all(dir2).ok();
+}
+
+#[tokio::test]
+async fn per_class_health_target_reaches_the_wire() {
+    // The class carries [classes.dev.health] url = connect://…: the
+    // candidate pre-check and the on-demand probe must issue a CONNECT to
+    // that authority — not the global generate_204 GET that can stay green
+    // while the class's real destination is blackholed.
+    // Three plane starts: both nodes probed, then "alternate" started again
+    // for the manual switch's pre-check.
+    let (ctx, class, trace, dir) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [("current", 204), ("alternate", 204), ("alternate", 204)],
+        1,
+        0,
+        "class-health-target",
+    );
+    let mut ctx = ctx;
+    install_class_health_override(&mut ctx, "dev", "connect://api.example:443");
+
+    // On-demand probe through the class's effective target. The count
+    // assertion keeps the all() honest: an empty recording would pass it.
+    let results = probe_now(&ctx, "dev").await;
+    assert!(results.iter().all(|r| r.ok), "fake plane answers 204 to both forms");
+    let requests = trace.requests();
+    assert_eq!(
+        requests.len(),
+        results.len(),
+        "every started plane must have recorded its request line"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|line| line.starts_with("CONNECT api.example:443 ")),
+        "every probe must use the class's CONNECT target: {requests:?}"
+    );
+
+    // The candidate pre-check (switch path) uses the same class target.
+    let before = trace.requests().len();
+    let outcome = switch_to(&ctx, &class, "alternate").await.unwrap();
+    assert_eq!(outcome.installed, "alternate");
+    let precheck_lines: Vec<String> = trace.requests()[before..].to_vec();
+    assert!(
+        precheck_lines
+            .iter()
+            .any(|line| line.starts_with("CONNECT api.example:443 ")),
+        "the activation pre-check must CONNECT to the class target: {precheck_lines:?}"
+    );
+
+    // Without an override the same flow issues the global GET shape.
+    let (ctx2, _class2, trace2, dir2) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [("current", 204), ("alternate", 204)],
+        1,
+        0,
+        "class-health-default",
+    );
+    let results2 = probe_now(&ctx2, "dev").await;
+    assert!(results2.iter().all(|r| r.ok));
+    let requests2 = trace2.requests();
+    assert_eq!(
+        requests2.len(),
+        results2.len(),
+        "every started plane must have recorded its request line"
+    );
+    assert!(
+        requests2.iter().all(|line| line.starts_with("GET http://")),
+        "no override keeps the global GET shape: {requests2:?}"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::remove_dir_all(dir2).ok();
 }
 
 #[tokio::test]

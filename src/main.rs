@@ -506,6 +506,13 @@ fn cmd_config_check(path: &std::path::Path) -> anyhow::Result<()> {
         cfg.health.fail_threshold,
         cfg.health.url
     );
+    for (name, class) in &cfg.classes {
+        if let Some(health) = &class.health {
+            if let Some(url) = &health.url {
+                pln!("    class {name:<10} health target = {url}");
+            }
+        }
+    }
     pln!(
         "  selection: hysteresis {:.2}, ema_alpha {:.2}",
         cfg.selection.hysteresis,
