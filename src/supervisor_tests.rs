@@ -55,11 +55,20 @@ impl FakeTrace {
 /// keeping every test entirely local and deterministic.
 struct FakePlane {
     responses: Mutex<VecDeque<(String, u16)>>,
+    /// Per-node responder delay in ms, empty by default. Lets ordering
+    /// tests invert completion order deterministically (a node's delay
+    /// decides when it finishes, so completion order can be made to
+    /// differ from pool order on purpose) instead of hoping for
+    /// scheduler jitter.
+    delays: HashMap<String, u64>,
     trace: Arc<FakeTrace>,
 }
 
 impl FakePlane {
-    fn new(responses: impl IntoIterator<Item = (&'static str, u16)>) -> (Self, Arc<FakeTrace>) {
+    fn new_with_delays(
+        responses: impl IntoIterator<Item = (&'static str, u16)>,
+        delays: HashMap<String, u64>,
+    ) -> (Self, Arc<FakeTrace>) {
         let trace = Arc::new(FakeTrace::default());
         let responses = responses
             .into_iter()
@@ -68,6 +77,7 @@ impl FakePlane {
         (
             Self {
                 responses: Mutex::new(responses),
+                delays,
                 trace: Arc::clone(&trace),
             },
             trace,
@@ -148,6 +158,7 @@ impl DataPlane for FakePlane {
         );
         let node_name = spec.node.name().to_string();
         self.trace.starts.lock().unwrap().push(node_name.clone());
+        let delay_ms = self.delays.get(&node_name).copied().unwrap_or(0);
 
         let socks_addr = spec.socks_addr();
         let http_addr = spec.http_addr();
@@ -188,6 +199,9 @@ impl DataPlane for FakePlane {
                             .to_string();
                         trace.requests.lock().unwrap().push(line);
                     }
+                }
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\n\r\n");
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -313,6 +327,18 @@ fn write_private(path: &std::path::Path, contents: &str, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Fake curl that drains the curl-config the fetcher receives on stdin
+/// BEFORE printing `body` and exiting: a child that exits first races the
+/// parent's write_all into EPIPE, failing prepare with "subscription
+/// preparation failed" (measured: 36% red under 12-way test contention, 0
+/// after this drain — same shape as subscription.rs's own fake fetcher).
+fn fake_fetcher_script(body: &str) -> String {
+    format!(
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{}'\n",
+        body.replace('\\', "\\\\").replace('\'', "'\\''")
+    )
+}
+
 fn recovery_fixture(
     nodes: Vec<Node>,
     responses: impl IntoIterator<Item = (&'static str, u16)>,
@@ -325,10 +351,35 @@ fn recovery_fixture(
     Arc<FakeTrace>,
     PathBuf,
 ) {
+    recovery_fixture_with_delays(
+        nodes,
+        responses,
+        generation,
+        drain_grace_secs,
+        label,
+        HashMap::new(),
+    )
+}
+
+/// Variant with per-node responder delays (see [`FakePlane::delays`]) for
+/// tests that must control completion order.
+fn recovery_fixture_with_delays(
+    nodes: Vec<Node>,
+    responses: impl IntoIterator<Item = (&'static str, u16)>,
+    generation: u64,
+    drain_grace_secs: u64,
+    label: &str,
+    delays: HashMap<String, u64>,
+) -> (
+    Arc<Ctx>,
+    Arc<tokio::sync::Mutex<ClassRuntime>>,
+    Arc<FakeTrace>,
+    PathBuf,
+) {
     let dir = test_dir(label);
     let cfg = test_config(dir.join("state.json"), drain_grace_secs);
     let catalog = cfg.subscriptions.clone();
-    let (plane, trace) = FakePlane::new(responses);
+    let (plane, trace) = FakePlane::new_with_delays(responses, delays);
     let current = nodes
         .iter()
         .find(|candidate| candidate.name() == "current")
@@ -979,10 +1030,7 @@ async fn state_commit_failure_keeps_live_and_confirmed_cache_generation() {
 
     let fetcher = dir.join("fake-curl");
     let body = one_node_manifest("candidate");
-    let script = format!(
-        "#!/bin/sh\nprintf '%s' '{}'\n",
-        body.replace('\\', "\\\\").replace('\'', "'\\''")
-    );
+    let script = fake_fetcher_script(&body);
     write_private(&fetcher, &script, 0o700);
     let _fetcher_override = subscription::TestCurlOverride::install(url_file.clone(), fetcher);
 
@@ -1320,10 +1368,7 @@ async fn cache_commit_keeps_owned_guards_after_subscription_task_abort() {
 
     let fetcher = dir.join("fake-curl");
     let body = one_node_manifest("candidate");
-    let script = format!(
-        "#!/bin/sh\nprintf '%s' '{}'\n",
-        body.replace('\\', "\\\\").replace('\'', "'\\''")
-    );
+    let script = fake_fetcher_script(&body);
     write_private(&fetcher, &script, 0o700);
     let _fetcher_override = subscription::TestCurlOverride::install(url_file.clone(), fetcher);
 
@@ -1394,13 +1439,26 @@ async fn cache_commit_keeps_owned_guards_after_subscription_task_abort() {
         let classes = Arc::clone(&classes);
         tokio::spawn(async move { switch_subscription(&ctx, &classes, target).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
+    // The spin exits the moment the worker sets the flag. On expiry, name the
+    // transaction's own recorded error: a bare Elapsed(()) hid the real failure
+    // mode (fetcher stdin race, see fake_fetcher_script) for a whole review
+    // round. The ceiling must exceed the fixture's own precommit deadline
+    // (precommit_timeout, 1 s above): prepare, gating and activation all run
+    // inside it, and once it lapses the transaction aborts before the commit
+    // hook can set the flag, so no larger ceiling helps. Measured time-to-flag
+    // p99 49 ms under load avg 33 (2026-09-26). Re-derive both numbers if this
+    // fixture ever grows responder delays or a longer precommit_timeout.
+    if tokio::time::timeout(Duration::from_secs(2), async {
         while !commit_started.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("cache commit worker should start");
+    .is_err()
+    {
+        let recent: Vec<_> = ctx.events.snapshot().into_iter().rev().take(3).collect();
+        panic!("cache commit worker should start; recent events: {recent:?}");
+    }
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert!(
@@ -1893,6 +1951,11 @@ async fn class_target_probe_verdicts_never_touch_the_shared_scores() {
 
     let results = probe_now(&ctx, "dev").await;
     assert_eq!(
+        results.iter().map(|r| r.node.as_str()).collect::<Vec<_>>(),
+        vec!["current", "alternate"],
+        "the listing carries every pool node, in pool order (ordering pin: probe_now_results_follow_pool_order_not_completion_order)"
+    );
+    assert_eq!(
         results.iter().map(|r| r.ok).collect::<Vec<_>>(),
         vec![false, true],
         "verdicts are still reported per node"
@@ -1996,6 +2059,50 @@ async fn per_class_health_target_reaches_the_wire() {
 
     std::fs::remove_dir_all(dir).ok();
     std::fs::remove_dir_all(dir2).ok();
+}
+
+/// The pool-order contract, pinned deterministically: four nodes with
+/// NON-MONOTONIC responder delays (pool positions 1-4 answer in
+/// 200/600/400/100 ms) and a mixed verdict ("late" fails 503, so its rtt
+/// is None), so pool order and the six re-rankings a collector could
+/// apply — completion (delay-ascending), rtt-ascending (None ranked as
+/// the worst latency, so "late" sorts last), rtt-descending (same None
+/// rule, so "late" sorts first), name-sorted, failures-first,
+/// successes-first — are seven distinct permutations. Mutation-verified
+/// 2026-09-26: completion, name-sort, rtt-descending, failures-first and
+/// successes-first all caught with their predicted signatures; an
+/// rtt-ascending collector also differs from pool order ([last, current,
+/// middle, late]) and dies on the same assert.
+/// The teeth rely on two fixture invariants: PROBE_NOW_CONCURRENCY must
+/// stay >= 3 for this fixture so probes overlap (measured threshold: at 2
+/// the completion axis goes vacuous; the rtt/name/verdict axes bite at
+/// any concurrency), and the largest delay (600 ms) must stay under the
+/// fixture's health.timeout_ms (1000 ms) so no probe times out.
+#[tokio::test]
+async fn probe_now_results_follow_pool_order_not_completion_order() {
+    let (ctx, _class, _trace, dir) = recovery_fixture_with_delays(
+        vec![node("current"), node("middle"), node("late"), node("last")],
+        [("current", 204), ("middle", 204), ("late", 503), ("last", 204)],
+        1,
+        0,
+        "probe-pool-order",
+        HashMap::from([
+            ("current".to_string(), 200u64),
+            ("middle".to_string(), 600),
+            ("late".to_string(), 400),
+            ("last".to_string(), 100),
+        ]),
+    );
+    let results = probe_now(&ctx, "dev").await;
+    assert_eq!(
+        results
+            .iter()
+            .map(|r| (r.node.as_str(), r.ok))
+            .collect::<Vec<_>>(),
+        vec![("current", true), ("middle", true), ("late", false), ("last", true)],
+        "wrong orderings: completion [last, current, late, middle]; name [current, last, late, middle]; rtt-asc [last, current, middle, late]; rtt-desc [late, middle, current, last]; failures-first [late, current, middle, last]; successes-first [current, middle, last, late]"
+    );
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]
