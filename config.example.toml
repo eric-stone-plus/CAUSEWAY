@@ -92,10 +92,14 @@ listen = "127.0.0.1:17879"      # market-data traffic
 # destination to actually work: `http://` targets are judged by a plaintext
 # GET (2xx = healthy), `connect://host[:port]` targets by whether an HTTP
 # CONNECT tunnel can be established (2xx = reachable) — the right shape for
-# services whose plaintext HTTP answers never read 2xx. Caveat: a 2xx proves
-# the egress path accepted the tunnel, not that the origin answered; an
-# egress that accepts every CONNECT optimistically will read permanently
-# healthy. Verdicts against a class-specific target deliberately never
+# services whose plaintext HTTP answers never read 2xx. Caveat: a 2xx CONNECT
+# reply can be generated locally by an adapter that answers optimistically
+# before dialing the target — measured against such a data plane it returns
+# 2xx even for blackhole authorities, i.e. permanently healthy with zero
+# discriminating power, strictly weaker than a real end-to-end GET. Prefer
+# `http://` whenever the origin answers 2xx to plaintext HTTP; treat
+# `connect://` as "probe the data plane's CONNECT semantics first".
+# Verdicts against a class-specific target deliberately never
 # write the shared per-node scores: they describe one destination, not the
 # node's generic fitness (the class's automatic ranking keeps using the
 # generic scores; its recovery streak is per-session, in-memory).

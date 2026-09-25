@@ -1,6 +1,6 @@
 //! Health check: a generate_204-style plaintext HTTP GET through the whole
-//! path, or a CONNECT-tunnel reachability probe for services whose own HTTP
-//! semantics say nothing about reachability.
+//! path, or a CONNECT-tunnel probe for services whose own HTTP semantics say
+//! nothing about reachability.
 //!
 //! Deliberately a hand-rolled minimal HTTP/1.1 request instead of pulling in
 //! reqwest/hyper: the request is three lines, only the status line is read —
@@ -144,11 +144,16 @@ pub async fn http_get_status_timed(
 
 
 /// Open an HTTP CONNECT tunnel to `connect://host[:port]` through the proxy
-/// entry point and return the tunnel reply's status code (2xx = the
-/// egress accepted the tunnel). For services whose API edge redirects
-/// plaintext HTTP (so a GET would never read 2xx), an accepted CONNECT is
-/// the reachability fact we want — with the documented caveat that it
-/// proves the egress's acceptance, not the origin's answer.
+/// entry point and return the tunnel reply's status code.
+///
+/// Measured semantics (2026-09-25, adversarial review): a 2xx status line
+/// only proves the local listener→adapter chain is alive. An adapter whose
+/// inbound answers CONNECT optimistically — replying before dialing the
+/// target — returns 2xx even for RFC 5737 blackhole authorities, so this
+/// probe can be tautologically healthy and is then strictly weaker than a
+/// real end-to-end GET. Whether 2xx means "target reachable" depends
+/// entirely on the data plane's CONNECT semantics; prefer `http://` GET
+/// targets whenever the origin answers 2xx to plaintext HTTP.
 pub async fn connect_status_timed(
     proxy_addr: SocketAddr,
     url: &str,
@@ -178,8 +183,9 @@ pub async fn connect_status_timed(
 }
 
 /// The effective health check for a configured target: GET for `http://`
-/// URLs, CONNECT reachability for `connect://` authorities. Returns the
-/// status code; 2xx counts as healthy in both forms.
+/// URLs, the CONNECT probe for `connect://` authorities (see
+/// [`connect_status_timed`] for how much a 2xx there actually proves).
+/// Returns the status code; 2xx counts as healthy in both forms.
 pub async fn check_status_timed(
     proxy_addr: SocketAddr,
     url: &str,
@@ -321,6 +327,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code, 204);
+        task.await.unwrap();
+    }
+
+    /// Pin the 2xx-only verdict for `http://` targets: an origin that answers
+    /// redirects (3xx) is NOT healthy. Pointing a class health target at such
+    /// an origin without changing the verdict would make every check fail and
+    /// burn the class's recovery loop — the trap the connect:// caveat warns
+    /// about, nailed from the other side.
+    #[tokio::test]
+    async fn redirecting_origin_is_not_healthy_under_the_2xx_verdict() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                request.starts_with("GET http://api.example/ HTTP/1.1\r\n"),
+                "wire shape: {request}"
+            );
+            sock.write_all(b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://api.example/\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let healthy = is_healthy(addr, "http://api.example/", Duration::from_secs(2)).await;
+        assert!(!healthy, "3xx must not count as healthy");
         task.await.unwrap();
     }
 }
