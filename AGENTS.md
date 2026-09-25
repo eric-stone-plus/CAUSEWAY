@@ -63,7 +63,9 @@ cargo clippy           # before committing (not a hard gate)
   through the control protocol plus state/config/subscription/score —
   pinned by `ui_module_imports_only_the_control_protocol_surface`.
 - `src/health.rs` + `src/config.rs` per-class health targets
-  (`[classes.<name>.health]`): plaintext GET or `connect://` reachability,
+  (`[classes.<name>.health]`): plaintext GET or `connect://` tunnel probe
+  (only as strong as the data plane's CONNECT semantics — an adapter that
+  answers CONNECT optimistically makes the verdict tautological),
   class-local failure streak, override verdicts never write shared scores.
   The effective target per class is visible via `causeway config check`
   only (the TUI does not surface it yet).

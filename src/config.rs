@@ -137,14 +137,15 @@ pub struct ClassSelection {
 
 /// Keys of [health] that a single class may override. The target is either a
 /// plaintext `http://` URL (GET, 2xx = healthy) or a `connect://host[:port]`
-/// authority (CONNECT-tunnel reachability, 2xx = healthy) for services whose
-/// plaintext HTTP semantics would never read 2xx. Two caveats: a 2xx CONNECT
-/// proves the egress accepted the tunnel, not that the origin answered; and
-/// verdicts judged by this class's target deliberately never write the
-/// shared per-node scores (they describe one destination, not the node's
-/// generic fitness) — the class's automatic ranking keeps using the generic
-/// scores. The class-local failure streak driving recovery is per-session
-/// (in-memory), like the recovery backoff.
+/// authority (CONNECT-tunnel probe, 2xx = healthy) for services whose
+/// plaintext HTTP semantics would never read 2xx. A 2xx CONNECT reply can be
+/// generated locally by an optimistic data plane — see
+/// [`crate::health::connect_status_timed`] for the measured semantics and
+/// when `connect://` is worth trusting. Verdicts judged by this class's
+/// target deliberately never write the shared per-node scores (they describe
+/// one destination, not the node's generic fitness) — the class's automatic
+/// ranking keeps using the generic scores. The class-local failure streak
+/// driving recovery is per-session (in-memory), like the recovery backoff.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct ClassHealth {
     #[serde(default)]
