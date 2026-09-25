@@ -2021,7 +2021,36 @@ async fn health_loop(
         }
 
         let _reconfiguration = ctx.reconfiguration.read().await;
-        let ok = health::is_healthy(listen_addr, ctx.cfg.class_health_url(&name), timeout).await;
+        // Multi-sample any-fail verdict: field degradation comes in bursts
+        // (measured 3-23% per-probe failure rates), invisible to one sample
+        // per tick. The gate is held across the whole tick — sampling,
+        // recording, and recovery must see the same active plane, or a
+        // verdict measured against the old path books against the new one.
+        // The config layer bounds the sampling phase
+        // (samples × (timeout + 1s) ≤ min(interval, 60s)) so the hold cannot
+        // starve the subscription precommit fuse; the recovery extension of
+        // the hold is pre-existing. Activation pre-checks and on-demand
+        // probes stay single-shot by design — they gate latency-sensitive
+        // paths (the switch budget, precommit staging), and this loop is
+        // what catches a burst-degraded node after the fact (recovery
+        // backoff bounds the re-landing churn).
+        let verdict = health::is_healthy_sampled(
+            listen_addr,
+            ctx.cfg.class_health_url(&name),
+            timeout,
+            ctx.cfg.class_health_samples(&name),
+            || *shutdown.borrow(),
+        )
+        .await;
+        if verdict == health::SampledVerdict::Cancelled {
+            return;
+        }
+        // A shutdown racing the verdict must not book a health fact it will
+        // never act on, nor launch recovery mid-teardown.
+        if *shutdown.borrow() {
+            return;
+        }
+        let ok = verdict == health::SampledVerdict::Healthy;
         let (failures, has_active) = {
             let mut rt = class.lock().await;
             record_health_outcome(&ctx, &mut rt, ok)
@@ -2031,7 +2060,7 @@ async fn health_loop(
             if has_active {
                 warn!(class = %name, failures, threshold = ctx.cfg.health.fail_threshold, "health check failed");
             }
-            if failures >= ctx.cfg.health.fail_threshold {
+            if failures >= ctx.cfg.health.fail_threshold && !*shutdown.borrow() {
                 // This cycle already holds the reconfiguration read gate;
                 // taking it recursively could deadlock behind a queued writer.
                 recover_after_health_failure(&ctx, &class).await;

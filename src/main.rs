@@ -500,16 +500,20 @@ fn cmd_config_check(path: &std::path::Path) -> anyhow::Result<()> {
         cfg.probe.concurrency
     );
     pln!(
-        "  health: every {}s, timeout {}ms, threshold {}, url {}",
+        "  health: every {}s, timeout {}ms, threshold {}, samples {}, url {}",
         cfg.health.interval_secs,
         cfg.health.timeout_ms,
         cfg.health.fail_threshold,
+        cfg.health.samples,
         cfg.health.url
     );
     for (name, class) in &cfg.classes {
         if let Some(health) = &class.health {
             if let Some(url) = &health.url {
                 pln!("    class {name:<10} health target = {url}");
+            }
+            if let Some(samples) = health.samples {
+                pln!("    class {name:<10} health samples = {samples}");
             }
         }
     }
