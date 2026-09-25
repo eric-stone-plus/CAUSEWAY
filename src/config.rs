@@ -137,19 +137,24 @@ pub struct ClassSelection {
 
 /// Keys of [health] that a single class may override. The target is either a
 /// plaintext `http://` URL (GET, 2xx = healthy) or a `connect://host[:port]`
-/// authority (CONNECT-tunnel probe, 2xx = healthy) for services whose
-/// plaintext HTTP semantics would never read 2xx. A 2xx CONNECT reply can be
-/// generated locally by an optimistic data plane — see
-/// [`crate::health::connect_status_timed`] for the measured semantics and
-/// when `connect://` is worth trusting. Verdicts judged by this class's
-/// target deliberately never write the shared per-node scores (they describe
-/// one destination, not the node's generic fitness) — the class's automatic
-/// ranking keeps using the generic scores. The class-local failure streak
-/// driving recovery is per-session (in-memory), like the recovery backoff.
+/// authority (CONNECT tunnel plus write-through probe: a 2xx tunnel reply,
+/// then at least one response byte to a plaintext probe written into the
+/// tunnel) for services whose plaintext HTTP semantics would never read 2xx
+/// — see [`crate::health::connect_status_timed`] for the measured semantics
+/// and the honest limits. Verdicts judged by this class's target deliberately
+/// never write the shared per-node scores (they describe one destination, not
+/// the node's generic fitness) — the class's automatic ranking keeps using
+/// the generic scores. The class-local failure streak driving recovery is
+/// per-session (in-memory), like the recovery backoff.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct ClassHealth {
     #[serde(default)]
     pub url: Option<String>,
+    /// Per-tick probe samples for this class (any-fail verdict). Overrides
+    /// `[health].samples`. Bounded bursts of intermittent degradation are
+    /// invisible to a single sample; see `health::is_healthy_sampled`.
+    #[serde(default)]
+    pub samples: Option<u32>,
 }
 
 /// Static destination routing compiled into each supervised data plane.
@@ -254,6 +259,14 @@ pub struct HealthConfig {
     pub fail_threshold: u32,
     #[serde(default = "default_health_url")]
     pub url: String,
+    /// Probe samples per health tick, all of which must pass (any-fail).
+    /// Field degradation is bursty (measured 3-23% per-probe failure rates
+    /// on affected nodes); K samples lift a per-connection rate p to a
+    /// per-tick rate 1-(1-p)^K. Worst-case tick cost is
+    /// samples × (timeout_ms + 1s spacing), validated against the tick
+    /// interval and [`MAX_HEALTH_TICK_BUDGET_MS`].
+    #[serde(default = "default_health_samples")]
+    pub samples: u32,
     /// Minimum drain grace period (seconds) for an old data plane after a
     /// switch. A path with captured client connections remains alive longer,
     /// subject to the supervisor's bounded retirement fail-safe.
@@ -350,6 +363,27 @@ fn default_health_fail_threshold() -> u32 {
 fn default_health_url() -> String {
     "http://www.gstatic.com/generate_204".to_string()
 }
+fn default_health_samples() -> u32 {
+    1
+}
+
+/// Absolute ceiling for one health tick's probe budget
+/// (samples × (timeout_ms + 1s spacing)). The tick's sampling phase runs
+/// under the reconfiguration read gate; an unbounded tick starves the
+/// subscription transaction's 150s precommit fuse (a slow endpoint fetch
+/// plus a long gate hold blows the shared deadline) and inflates
+/// time-to-switch ≈ fail_threshold × (interval + tick). 60s keeps at least
+/// 90s of the fuse for fetch and staging while still admitting the
+/// measured-degradation envelope (10 samples × the default 5s timeout).
+const MAX_HEALTH_TICK_BUDGET_MS: u64 = 60_000;
+
+/// Worst-case cost of one sampled health tick. Saturating: a malformed
+/// timeout_ms must reach an actionable bail, never an arithmetic panic
+/// (debug) or a silent wrap (release) that would smuggle an unbounded
+/// tick past validation.
+fn health_tick_budget_ms(samples: u32, timeout_ms: u64) -> u64 {
+    u64::from(samples).saturating_mul(timeout_ms.saturating_add(1000))
+}
 fn default_drain_grace() -> u64 {
     10
 }
@@ -395,6 +429,7 @@ impl Default for HealthConfig {
             timeout_ms: default_health_timeout_ms(),
             fail_threshold: default_health_fail_threshold(),
             url: default_health_url(),
+            samples: default_health_samples(),
             drain_grace_secs: default_drain_grace(),
         }
     }
@@ -489,6 +524,17 @@ impl Config {
         self.class_health_override(class).unwrap_or(&self.health.url)
     }
 
+    /// Effective per-tick health samples for a class: class override, else
+    /// `[health].samples`. Any-fail verdict; see
+    /// [`crate::health::is_healthy_sampled`].
+    pub fn class_health_samples(&self, class: &str) -> u32 {
+        self.classes
+            .get(class)
+            .and_then(|c| c.health.as_ref())
+            .and_then(|h| h.samples)
+            .unwrap_or(self.health.samples)
+    }
+
     /// Compact per-class policy summary for the dashboard strip, e.g.
     /// "regions=hk,jp auto=off". Empty = inherits global [selection].
     pub fn class_selection_summary(&self, class: &str) -> String {
@@ -553,6 +599,25 @@ impl Config {
                         );
                     }
                 }
+                if let Some(samples) = health.samples {
+                    if !(1..=10).contains(&samples) {
+                        bail!("classes.{name}.health.samples must be within 1..=10, got {samples}");
+                    }
+                    // The class tick runs on the global interval/timeout —
+                    // only url and samples are overridable.
+                    let tick_cap = self
+                        .health
+                        .interval_secs
+                        .saturating_mul(1000)
+                        .min(MAX_HEALTH_TICK_BUDGET_MS);
+                    let tick_budget = health_tick_budget_ms(samples, self.health.timeout_ms);
+                    if tick_budget > tick_cap {
+                        bail!(
+                            "classes.{name}.health.samples={samples} with [health].timeout_ms={} needs a {tick_budget}ms tick budget, above the cap min(interval_secs×1000, {MAX_HEALTH_TICK_BUDGET_MS})={tick_cap}ms — lower samples, or adjust [health].interval_secs / timeout_ms",
+                            self.health.timeout_ms
+                        );
+                    }
+                }
             }
         }
         self.routing.validate()?;
@@ -611,6 +676,25 @@ impl Config {
         }
         if self.health.fail_threshold == 0 {
             bail!("health.fail_threshold must be >= 1");
+        }
+        if !(1..=10).contains(&self.health.samples) {
+            bail!(
+                "health.samples must be within 1..=10, got {}",
+                self.health.samples
+            );
+        }
+        let tick_cap = self
+            .health
+            .interval_secs
+            .saturating_mul(1000)
+            .min(MAX_HEALTH_TICK_BUDGET_MS);
+        let tick_budget = health_tick_budget_ms(self.health.samples, self.health.timeout_ms);
+        if tick_budget > tick_cap {
+            bail!(
+                "health.samples={} with timeout_ms={} needs a {tick_budget}ms tick budget, above the cap min(interval_secs×1000, {MAX_HEALTH_TICK_BUDGET_MS})={tick_cap}ms — lower samples or timeout_ms, or raise interval_secs",
+                self.health.samples,
+                self.health.timeout_ms
+            );
         }
         if !(0.0..=1.0).contains(&self.selection.hysteresis) {
             bail!(
@@ -1369,6 +1453,114 @@ url = "connect://api.example:443"
             "http://www.gstatic.com/generate_204"
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn class_health_samples_override_inherit_and_default() {
+        let text = r#"
+[subscriptions]
+files = ["~/sub.yaml"]
+
+[health]
+samples = 2
+
+[classes.dev]
+listen = "127.0.0.1:17878"
+
+[classes.telegram]
+listen = "127.0.0.1:17885"
+
+[classes.telegram.health]
+url = "connect://api.example:443"
+samples = 5
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.class_health_samples("telegram"), 5, "class override wins");
+        assert_eq!(
+            cfg.class_health_samples("dev"),
+            2,
+            "classes without an override inherit [health].samples"
+        );
+        assert_eq!(cfg.class_health_samples("nope"), 2);
+        assert!(cfg.validate().is_ok());
+
+        let minimal: Config = toml::from_str(
+            "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            minimal.class_health_samples("dev"),
+            1,
+            "unset samples means one probe per tick, as before"
+        );
+        assert!(minimal.validate().is_ok());
+    }
+
+    #[test]
+    fn health_samples_out_of_range_is_rejected() {
+        for bad in ["samples = 0", "samples = 11"] {
+            let text = format!(
+                "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[health]\n{bad}\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n"
+            );
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("health.samples"), "{err}");
+
+            let text = format!(
+                "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n\n[classes.dev.health]\nurl = \"connect://api.example:443\"\n{bad}\n"
+            );
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("classes.dev.health.samples"), "{err}");
+        }
+    }
+
+    #[test]
+    fn health_tick_budget_is_bounded_by_interval_and_absolute_cap() {
+        let base = "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n";
+
+        // Default interval 30s / timeout 5s: 5 samples fit (5×6000=30000 ≤
+        // 30000), 6 do not.
+        let cfg: Config = toml::from_str(&format!("{base}\n[health]\nsamples = 5\n")).unwrap();
+        assert!(cfg.validate().is_ok());
+        let cfg: Config = toml::from_str(&format!("{base}\n[health]\nsamples = 6\n")).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("tick budget"), "{err}");
+
+        // A huge interval does not lift the absolute ceiling: one tick must
+        // stay well inside the subscription transaction's precommit fuse.
+        let cfg: Config = toml::from_str(&format!(
+            "{base}\n[health]\ninterval_secs = 600\ntimeout_ms = 59000\nsamples = 10\n"
+        ))
+        .unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("60000"), "{err}");
+        // At the ceiling edge it still fits: 10 × (5000+1000) = 60000.
+        let cfg: Config =
+            toml::from_str(&format!("{base}\n[health]\ninterval_secs = 600\nsamples = 10\n"))
+                .unwrap();
+        assert!(cfg.validate().is_ok());
+
+        // Overflow must reach an actionable bail — never an arithmetic panic
+        // (debug) or a silent wrap (release) that smuggles the tick past the
+        // cap. TOML integers top out at i64::MAX; 10 × (i64::MAX + 1000)
+        // still overflows u64 and must saturate into rejection.
+        let cfg: Config = toml::from_str(&format!(
+            "{base}\n[health]\ntimeout_ms = {}\nsamples = 10\n",
+            i64::MAX
+        ))
+        .unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("tick budget"), "{err}");
+
+        // A per-class override inherits the same budget.
+        let cfg: Config = toml::from_str(&format!(
+            "{base}\n[classes.dev.health]\nurl = \"connect://api.example:443\"\nsamples = 6\n"
+        ))
+        .unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("classes.dev.health.samples"), "{err}");
+        assert!(err.contains("tick budget"), "{err}");
     }
 
     #[test]

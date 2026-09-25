@@ -90,21 +90,26 @@ listen = "127.0.0.1:17879"      # market-data traffic
 # pre-checks, and on-demand end-to-end probes all consult it instead of the
 # global [health].url. Use this when a class's traffic needs one specific
 # destination to actually work: `http://` targets are judged by a plaintext
-# GET (2xx = healthy), `connect://host[:port]` targets by whether an HTTP
-# CONNECT tunnel can be established (2xx = reachable) — the right shape for
-# services whose plaintext HTTP answers never read 2xx. Caveat: a 2xx CONNECT
-# reply can be generated locally by an adapter that answers optimistically
-# before dialing the target — measured against such a data plane it returns
-# 2xx even for blackhole authorities, i.e. permanently healthy with zero
-# discriminating power, strictly weaker than a real end-to-end GET. Prefer
-# `http://` whenever the origin answers 2xx to plaintext HTTP; treat
-# `connect://` as "probe the data plane's CONNECT semantics first".
+# GET (2xx = healthy), `connect://host[:port]` targets by a CONNECT tunnel
+# plus a write-through probe — after a 2xx tunnel reply the checker writes a
+# minimal plaintext HTTP request into the tunnel and requires at least one
+# response byte (a TLS edge answers with a 4xx; the content is never
+# interpreted). EOF or silence-to-timeout after the tunnel reply =
+# unreachable. This defeats adapters that answer CONNECT optimistically
+# before dialing (measured 2026-09-25: blackhole authorities got local 2xx
+# replies in 0.000s). Requires the target to answer plaintext probes with
+# *something* — verify a candidate target's probe behavior first; a service
+# that waits silently for a TLS ClientHello would read unhealthy. Prefer
+# `http://` whenever the origin answers 2xx to plaintext HTTP: an
+# application-level 2xx is stronger evidence than the any-response-byte the
+# write-through accepts.
 # Verdicts against a class-specific target deliberately never
 # write the shared per-node scores: they describe one destination, not the
 # node's generic fitness (the class's automatic ranking keeps using the
 # generic scores; its recovery streak is per-session, in-memory).
 # [classes.market.health]
 # url = "connect://api.example.com:443"
+# samples = 3                  # per-tick probes, any-fail verdict (below)
 
 [probe]
 interval_secs = 600            # periodic re-probe interval (default 10 minutes)
@@ -117,6 +122,18 @@ timeout_ms = 5000              # per-check timeout
 fail_threshold = 3             # N consecutive failures trigger a switch
 url = "http://www.gstatic.com/generate_204"   # must be plaintext http://
 drain_grace_secs = 10          # minimum old-path grace; active pipes may extend it within a hard cap
+# samples = 1                  # probes per tick, all must pass (any-fail), 1..=10.
+                               # Field degradation is bursty (measured 3-23%
+                               # per-probe failure rates on affected nodes
+                               # while single-shot matrices read all-green);
+                               # K samples lift a per-connection rate p to a
+                               # per-tick rate 1-(1-p)^K. Fail-closed budget
+                               # rule: samples x (timeout_ms + 1s) must stay
+                               # <= min(interval_secs x 1000, 60000) — the
+                               # tick cost bounds how long the health loop
+                               # holds the reconfiguration gate, and the
+                               # detection latency is roughly
+                               # fail_threshold x (interval + tick).
 
 [selection]
 hysteresis = 0.30              # a challenger must win by a 30% clear margin

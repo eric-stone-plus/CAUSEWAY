@@ -63,12 +63,15 @@ cargo clippy           # before committing (not a hard gate)
   through the control protocol plus state/config/subscription/score —
   pinned by `ui_module_imports_only_the_control_protocol_surface`.
 - `src/health.rs` + `src/config.rs` per-class health targets
-  (`[classes.<name>.health]`): plaintext GET or `connect://` tunnel probe
-  (only as strong as the data plane's CONNECT semantics — an adapter that
-  answers CONNECT optimistically makes the verdict tautological),
-  class-local failure streak, override verdicts never write shared scores.
-  The effective target per class is visible via `causeway config check`
-  only (the TUI does not surface it yet).
+  (`[classes.<name>.health]`): plaintext GET or `connect://` write-through
+  probe (2xx tunnel reply + at least one response byte to a plaintext probe
+  written into the tunnel; EOF/timeout after the reply = unreachable —
+  defeats optimistic adapters that answer CONNECT before dialing). Ticks can
+  demand K samples under an any-fail rule (`health.samples`, per-class
+  override) because field degradation is bursty. Class-local failure streak;
+  override verdicts never write shared scores. The effective target per
+  class is visible via `causeway config check` only (the TUI does not
+  surface it yet).
 - `src/config.rs` — TOML loading, `~` expansion, hard validation.
 - `src/subscription.rs` — offline endpoint-manifest parsing, per-entry fault
   tolerance; unsupported entry types are rejected explicitly at parse time.

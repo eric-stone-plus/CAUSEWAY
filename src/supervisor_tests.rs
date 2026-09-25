@@ -189,10 +189,24 @@ impl DataPlane for FakePlane {
                         trace.requests.lock().unwrap().push(line);
                     }
                 }
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\n\r\n");
                 let _ = stream.write_all(response.as_bytes()).await;
+                // connect:// write-through: after a 2xx tunnel reply the
+                // checker writes a plaintext probe into the tunnel and
+                // requires response bytes. Mirror the field shape — a TLS
+                // edge answers a plaintext probe with a 400 — so class
+                // CONNECT targets read reachable.
+                if (200..300).contains(&status) {
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        if n > 0 {
+                            let _ = stream
+                                .write_all(
+                                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .await;
+                        }
+                    }
+                }
             }
         });
         let sequence = self.trace.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -218,6 +232,7 @@ fn install_class_health_override(ctx: &mut Arc<Ctx>, class: &str, url: &str) {
         .unwrap()
         .health = Some(crate::config::ClassHealth {
         url: Some(url.to_string()),
+        samples: None,
     });
 }
 
