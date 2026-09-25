@@ -40,7 +40,11 @@ pub async fn probe_one(server: &str, port: u16, timeout: Duration) -> Option<Dur
 }
 
 /// Probe all nodes concurrently, in arbitrary completion order; logs progress
-/// every 50 completions.
+/// every 50 completions. Callers consume outcomes by node name (the startup
+/// and periodic cycles record EMAs per node; the `causeway probe` CLI sorts
+/// the successful outcomes by RTT and counts failures). Contrast the
+/// on-demand end-to-end probe (`supervisor::probe_now_inner`), whose
+/// control-protocol listing is pool-ordered by contract.
 pub async fn probe_all(
     nodes: Vec<Node>,
     timeout: Duration,

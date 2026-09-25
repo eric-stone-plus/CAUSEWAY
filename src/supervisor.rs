@@ -23,7 +23,7 @@ use anyhow::{bail, Context};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, OwnedMutexGuard, OwnedRwLockWriteGuard, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, SubscriptionsConfig};
 use crate::control;
@@ -787,22 +787,49 @@ fn subscription_failure(ctx: &Ctx, profile: &str, message: &'static str) -> cont
 }
 
 async fn prepare_subscription(
+    target: &str,
     profile: crate::config::SubscriptionProfileConfig,
     allow_cached_fallback: bool,
     confirmed_slot: Option<String>,
 ) -> Result<PreparedSubscription, ()> {
+    let target = target.to_string();
     tokio::task::spawn_blocking(move || match subscription::prepare_profile(&profile) {
         Ok(prepared) => Ok(PreparedSubscription::Fresh(prepared)),
-        Err(_) if allow_cached_fallback => {
+        Err(e) if allow_cached_fallback => {
+            // Log the failure class, not a bare swallow: an opaque Err(())
+            // here hid a fetcher stdin race (EPIPE) from a whole review
+            // round. Local paths/messages only — the chain is built by
+            // subscription.rs and carries no provider endpoint. The profile
+            // identity complements subscription.rs's file-level warns
+            // (which profile failed vs which file failed).
+            debug!(
+                profile = %target,
+                error = %format!("{e:#}"),
+                "subscription prepare failed; trying confirmed cache"
+            );
             let nodes =
                 subscription::load_profile_snapshot_from_slot(&profile, confirmed_slot.as_deref());
             if nodes.is_empty() {
+                // The transaction dies here just like the no-fallback path,
+                // so the cause must be visible at the default level too.
+                warn!(
+                    profile = %target,
+                    error = %format!("{e:#}"),
+                    "subscription prepare failed; confirmed cache empty"
+                );
                 Err(())
             } else {
                 Ok(PreparedSubscription::Cached(nodes))
             }
         }
-        Err(_) => Err(()),
+        Err(e) => {
+            warn!(
+                profile = %target,
+                error = %format!("{e:#}"),
+                "subscription prepare failed"
+            );
+            Err(())
+        }
     })
     .await
     .map_err(|_| ())?
@@ -908,6 +935,7 @@ async fn switch_subscription_locked(
     let prepared = match tokio::time::timeout_at(
         deadline,
         prepare_subscription(
+            target,
             profile,
             allow_cached_fallback && !refreshed && source_trusted,
             confirmed_slot.clone(),
@@ -1656,6 +1684,14 @@ async fn switch_for_site(
 /// Bounded concurrency — every probe spawns a whole data-plane process.
 const PROBE_NOW_CONCURRENCY: usize = 8;
 
+/// End-to-end probe of every pool node through the class's effective health
+/// target. Results come back in POOL ORDER, not completion order: the
+/// control-protocol listing is deterministic for consumers, and positional
+/// assertions in tests stop racing task scheduling (a load-sensitive flake
+/// source, measured 2026-09-25). A panicked task leaves its slot empty —
+/// the listing is then short, which consumers already classify as
+/// incomplete. (Consumers must still key results by node name when talking
+/// to older daemons, which returned completion order.)
 async fn probe_now_inner(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResult> {
     let nodes = pool(ctx);
     // Every pool node is tested, but through the REQUESTING class's
@@ -1676,23 +1712,24 @@ async fn probe_now_inner(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResul
         .generation;
     let sem = Arc::new(Semaphore::new(PROBE_NOW_CONCURRENCY.min(total.max(1))));
     let mut set = JoinSet::new();
-    for node in nodes {
+    for (idx, node) in nodes.into_iter().enumerate() {
         let ctx = Arc::clone(ctx);
         let sem = Arc::clone(&sem);
         let health_url = health_url.clone();
         set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
-            probe_now_node(&ctx, node, era, &health_url, record).await
+            (idx, probe_now_node(&ctx, node, era, &health_url, record).await)
         });
     }
-    let mut out = Vec::with_capacity(total);
+    // Pool order, not completion order — see the function contract above.
+    let mut slots: Vec<Option<control::ProbeResult>> = vec![None; total];
     while let Some(res) = set.join_next().await {
         match res {
-            Ok(r) => out.push(r),
+            Ok((idx, r)) => slots[idx] = Some(r),
             Err(e) => warn!(error = %format!("{e:#}"), "probe task panicked"),
         }
     }
-    out
+    slots.into_iter().flatten().collect()
 }
 
 async fn probe_now(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResult> {

@@ -201,7 +201,10 @@ pub enum Request {
     SwitchSubscription { name: String },
     /// End-to-end latency test of every node (url-test style): a fresh data
     /// plane per node + generate_204 check, EMAs recorded, no switch. May
-    /// take tens of seconds — use a generous client timeout.
+    /// take tens of seconds — use a generous client timeout. The reply's
+    /// `probe` list comes back in pool order; consumers must still key
+    /// results by node name (daemons before the pool-order contract
+    /// returned completion order).
     ProbeNow { class: String },
     /// Snapshot of the recent-events ring buffer (newest last).
     Events,
@@ -341,7 +344,9 @@ pub struct NodeTraffic {
     pub down: u64,
 }
 
-/// Result of one end-to-end node test (`ProbeNow`).
+/// Result of one end-to-end node test (`ProbeNow`). Within a reply's `probe`
+/// list these are ordered by node-pool position (deterministic); a panicked
+/// probe task omits its entry, so the list may be shorter than the pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResult {
     pub node: String,
@@ -434,6 +439,7 @@ pub struct Reply {
     pub switch: Option<SwitchOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_switch: Option<SubscriptionSwitchOutcome>,
+    /// `ProbeNow` results, in node-pool order (see [`ProbeResult`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<Vec<ProbeResult>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
