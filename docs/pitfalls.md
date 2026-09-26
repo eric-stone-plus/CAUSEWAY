@@ -195,3 +195,61 @@ verifier health before changing further state: run the child manually with an
 equivalent config, and run the supervisor once outside its sandbox. Here
 both checks passed immediately, which isolated the fault to the observer
 rather than the observed — without touching the network to find out.
+
+## Fixture children that exit before draining stdin
+
+A test fixture that spawns a child process (a fake fetcher, a stub server)
+and then writes a request into its stdin owns a race it cannot see: if the
+child exits first — because it decided the request was complete, errored out,
+or was simply written to exit early — the parent's `write_all` hits EPIPE on
+a pipe with no reader. When that write sits inside a helper whose only
+failure channel is an outer timeout, the EPIPE never surfaces; the test fails
+as a bare "timed out", pointing every diagnosis at the wrong subsystem. Two
+lessons. Fixture children must drain stdin to EOF (`cat >/dev/null` in a
+shell stub) before exiting, so the parent's write always has a reader. And a
+test harness that maps every inner error onto one opaque `Elapsed(())`
+destroys the evidence it will need later — propagate the inner error, or log
+it, so a timeout says what timed out and why.
+
+## Loopback "port is closed" asserts: your own socket and the shared namespace
+
+Asserting that a shut-down listener is really gone by connecting to its old
+address and demanding refusal has two independent failure mechanisms, and
+conflating them costs a debugging round.
+
+The first is your OWN socket. `close()` returning does not mean the kernel
+finished destroying the listening socket; a SYN arriving inside that teardown
+window still completes a connection against a socket no process holds any
+more. Instrumented proof shape: at failure time `/proc/net/tcp` shows a
+LISTEN entry on the exact port whose inode matches the one recorded at bind
+time, no `/proc/*/fd` holds it, and microseconds later it is gone. This
+mechanism is invariant to how the port was chosen — port 0, fixed port,
+reserved range all race it — and it only widens under whole-suite load, so
+single-test hammering never sees it. The assert must therefore be "connect
+is refused within a bounded retry budget" (a few hundred ms of 5 ms retries
+comfortably outlasts the window), never "the very first connect is refused":
+a listener that genuinely never closed accepts for the whole budget and still
+fails the assert with teeth.
+
+The second is the shared namespace. The kernel recycles released ephemeral
+ports immediately, so between the release and the probe another thread's
+port-0 bind can land on the same port, and a concurrent suite process can
+rebind a fixed one; the assert then sees a live socket belonging to someone
+else. This side IS a port-allocation problem: bind a fixed port from a
+reserved range outside the ephemeral window (`ip_local_port_range`), give
+each concurrent actor a DISJOINT sub-range — one shared range is worse than
+port 0, because a sibling scanning it low-to-high deliberately re-takes the
+exact port just released (measured: 1.7% -> 11.7%) — rotate the per-process
+starting point inside the sub-range so the scan never wanders into the
+sibling's ports or assigned neighbors, and try the next port on
+address-in-use. Then enumerate the residual re-take actors (the same test in
+another concurrent process) and let the retry budget outlast them too. If
+the namespace cannot be made small enough, drop the shared-namespace probe
+entirely and assert on internal state no one else can re-take: joined task
+completion, connection counters.
+
+The general lesson: a "resource is gone" assert that probes through any
+shared, kernel-managed namespace must absorb the owner's own teardown window
+with a bounded retry, AND shrink the namespace until every remaining actor
+that could re-take the identity is enumerated and negligible — or not probe
+the namespace at all.
