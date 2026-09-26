@@ -111,6 +111,35 @@ fn remove_socket_if_owned(path: &Path, expected: SocketIdentity) -> anyhow::Resu
     Ok(())
 }
 
+/// Consecutive successful connects (spaced by [`LIVENESS_RECHECK_DELAY`])
+/// required before declaring a control socket live. A single connect can
+/// transiently succeed against a listener whose owning process already
+/// exited: close() returning does not mean the kernel finished destroying
+/// the listening socket — the AF_UNIX variant of the teardown window that
+/// makes TCP "connect refused after shutdown" asserts flake. Measured in
+/// 48-thread netns suite runs under load: 1/30 false "already active"
+/// refusals pre-fix (operator-side runs: 2/230). In-suite window sampling
+/// (57 persisted samples over ~150k distinct instrumented binds, two
+/// probe generations) put the window at p50 ~2-6 ms with a persisted max
+/// of 112 ms; every sampled trigger answered three back-to-back connects
+/// against its own still-dying socket (same inode), so a count alone
+/// cannot discriminate, four windows outlasted a single 50 ms gap, and a
+/// direct gap probe saw 0/14 triggers survive 50 ms. BOTH constants are
+/// load-bearing: the delay separates the checks in time, and the count
+/// spans the tail (5 connects = 4 gaps x 50 ms = 200 ms, ~1.8x the
+/// persisted max). The realistic product
+/// trigger is a stop-to-start restart back to back (a crash restart
+/// cannot hit it: RestartSec dwarfs the window). A genuinely live daemon
+/// keeps accepting, so persistence discriminates; refusal or reset at any
+/// point falls to the stale path immediately, preserving the "never
+/// remove a live socket" conservatism — at the cost of sampling Refused
+/// from a possibly-live socket more than once. Any other error still
+/// bails conservatively, and a same-state-file double start is refused
+/// earlier by the daemon flock, so this loop only ever sees sockets
+/// nobody holds a lock for.
+const LIVENESS_CONFIRMATIONS: usize = 5;
+const LIVENESS_RECHECK_DELAY: Duration = Duration::from_millis(50);
+
 async fn remove_stale_control_socket(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     let metadata = match std::fs::symlink_metadata(path) {
@@ -128,35 +157,59 @@ async fn remove_stale_control_socket(path: &Path) -> anyhow::Result<()> {
     }
     let identity = SocketIdentity::from_metadata(&metadata);
 
-    match tokio::time::timeout(SOCKET_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
-        Ok(Ok(_)) => bail!(
-            "control socket {} is already active; use the running CAUSEWAY daemon",
-            path.display()
-        ),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-            let current = std::fs::symlink_metadata(path)
-                .with_context(|| format!("re-inspect stale control socket {}", path.display()))?;
-            if !current.file_type().is_socket()
-                || SocketIdentity::from_metadata(&current) != identity
-            {
-                bail!(
-                    "control socket {} changed while checking it; refusing to remove it",
-                    path.display()
-                );
+    let mut confirmations = 0;
+    loop {
+        match tokio::time::timeout(SOCKET_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
+            Ok(Ok(_)) => {
+                confirmations += 1;
+                if confirmations >= LIVENESS_CONFIRMATIONS {
+                    bail!(
+                        "control socket {} is already active; use the running CAUSEWAY daemon",
+                        path.display()
+                    );
+                }
+                tokio::time::sleep(LIVENESS_RECHECK_DELAY).await;
             }
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove stale control socket {}", path.display()))
-        }
-        Ok(Err(error)) => Err(error).with_context(|| {
-            format!(
-                "cannot verify whether control socket {} is stale; refusing to remove it",
+            // Refused AND reset both mean "nobody is listening": a socket
+            // mid-teardown can answer a connect and then reset it (captured
+            // 2x in 160k instrumented product-path binds on the
+            // reduced-confirmation arms). The blast radius is bounded: a
+            // same-state-file double start is refused earlier by the daemon
+            // flock, and the identity recheck below still gates removal.
+            // Any other error stays a conservative bail.
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                ) => {
+                    let current = std::fs::symlink_metadata(path).with_context(|| {
+                        format!("re-inspect stale control socket {}", path.display())
+                    })?;
+                    if !current.file_type().is_socket()
+                        || SocketIdentity::from_metadata(&current) != identity
+                    {
+                        bail!(
+                            "control socket {} changed while checking it; refusing to remove it",
+                            path.display()
+                        );
+                    }
+                    return std::fs::remove_file(path).with_context(|| {
+                        format!("remove stale control socket {}", path.display())
+                    });
+                }
+            Ok(Err(error)) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot verify whether control socket {} is stale; refusing to remove it",
+                        path.display()
+                    )
+                })
+            }
+            Err(_) => bail!(
+                "timed out checking control socket {}; refusing to remove it",
                 path.display()
-            )
-        }),
-        Err(_) => bail!(
-            "timed out checking control socket {}; refusing to remove it",
-            path.display()
-        ),
+            ),
+        }
     }
 }
 
@@ -1071,6 +1124,44 @@ mod tests {
         assert!(path.exists(), "startup must replace the stale socket");
         drop(bound);
         assert!(!path.exists(), "owned socket must be removed on drop");
+        remove_test_socket(&path);
+    }
+
+    /// Liveness confirmation must wait out a DYING listener: a socket that
+    /// answers the first connect and is gone by the recheck is stale, not
+    /// active. This is the deterministic stand-in for the kernel teardown
+    /// window (a connect briefly succeeds against an already-exited owner's
+    /// socket), which single-shot liveness checks misread as "already
+    /// active" — a false refusal on the real daemon start path.
+    ///
+    /// The listener dies on a WALL-CLOCK TIMER (20 ms after accepting), not
+    /// immediately: an instant drop would also pass back-to-back rechecks,
+    /// leaving [`LIVENESS_RECHECK_DELAY`] unpinned (a zeroed delay restores
+    /// the flake at base rate — measured 3/80k in-suite binds). With the
+    /// timer, both constants are mutant-verified: CONFIRMATIONS=1 bails on
+    /// the first Ok, and DELAY=0 packs every connect inside the 20 ms life
+    /// window — each kills exactly this pin while the live-socket and
+    /// stale-socket tests stay green.
+    #[tokio::test]
+    async fn liveness_confirmation_waits_out_a_dying_listener() {
+        let path = test_socket_path("dying");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // Accept the first liveness connect, then die 20 ms later — after
+        // back-to-back rechecks would have passed, before a real
+        // LIVENESS_RECHECK_DELAY-spaced recheck.
+        let server = tokio::spawn(async move {
+            let (_stream, _peer) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(listener);
+        });
+
+        remove_stale_control_socket(&path).await.unwrap();
+        assert!(
+            !path.exists(),
+            "a listener that died mid-confirmation is stale and must be removed"
+        );
+        server.await.unwrap();
         remove_test_socket(&path);
     }
 
