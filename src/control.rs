@@ -328,7 +328,7 @@ pub struct ClassOverview {
     pub listen: String,
     pub active_node: Option<String>,
     pub generation: u64,
-    /// Compact per-class selection policy (e.g. "regions=🇭🇰,日本 auto=off");
+    /// Compact per-class selection policy (e.g. "regions=Region-A,Region-B auto=off");
     /// empty means the class inherits the global [selection]. Defaulted so a
     /// strip from an older daemon still decodes.
     #[serde(default)]
@@ -812,10 +812,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::Switch {
                 class: "dev".into(),
-                node: "hk01".into()
+                node: "ra01".into()
             })
             .unwrap(),
-            r#"{"cmd":"switch","class":"dev","node":"hk01"}"#
+            r#"{"cmd":"switch","class":"dev","node":"ra01"}"#
         );
         assert_eq!(
             serde_json::to_string(&Request::SwitchSubscription {
@@ -847,12 +847,12 @@ mod tests {
             serde_json::to_string(&Event::Switched {
                 unix: 1,
                 class: "dev".into(),
-                node: "hk01".into(),
+                node: "ra01".into(),
                 reason: "manual".into(),
                 generation: 4,
             })
             .unwrap(),
-            r#"{"kind":"switched","unix":1,"class":"dev","node":"hk01","reason":"manual","generation":4}"#
+            r#"{"kind":"switched","unix":1,"class":"dev","node":"ra01","reason":"manual","generation":4}"#
         );
         assert_eq!(
             serde_json::to_string(&Event::SubscriptionChanged {
@@ -879,10 +879,10 @@ mod tests {
     #[test]
     fn reply_roundtrips() {
         let mut nodes = BTreeMap::new();
-        nodes.insert("hk01".to_string(), NodeStats::default());
+        nodes.insert("ra01".to_string(), NodeStats::default());
         let snap = StatusSnapshot {
             class: "dev".into(),
-            active_node: Some("hk01".into()),
+            active_node: Some("ra01".into()),
             socks_port: Some(41381),
             http_port: Some(37965),
             generation: 3,
@@ -902,13 +902,13 @@ mod tests {
                     node_count: None,
                 },
             ],
-            available_nodes: vec!["hk01".into()],
+            available_nodes: vec!["ra01".into()],
             classes: vec![ClassOverview {
                 name: "dev".into(),
-                listen: "127.0.0.1:17878".into(),
-                active_node: Some("hk01".into()),
+                listen: "127.0.0.1:20100".into(),
+                active_node: Some("ra01".into()),
                 generation: 3,
-                selection: "regions=HK auto=off".into(),
+                selection: "regions=RA auto=off".into(),
             }],
         };
         let status = roundtrip(&Reply::ok_status(snap)).status.unwrap();
@@ -916,16 +916,16 @@ mod tests {
         assert_eq!(status.subscription_generation, Some(7));
         assert_eq!(status.subscription_txn_in_progress, Some(false));
         assert_eq!(status.available_subscriptions.len(), 2);
-        assert_eq!(status.available_nodes, ["hk01"]);
+        assert_eq!(status.available_nodes, ["ra01"]);
         assert_eq!(status.classes.len(), 1);
-        assert_eq!(status.classes[0].listen, "127.0.0.1:17878");
+        assert_eq!(status.classes[0].listen, "127.0.0.1:20100");
         assert_eq!(
-            status.classes[0].selection, "regions=HK auto=off",
+            status.classes[0].selection, "regions=RA auto=off",
             "a populated per-class policy survives the wire"
         );
 
         let probed = vec![ProbeResult {
-            node: "hk01".into(),
+            node: "ra01".into(),
             ok: true,
             rtt_ms: Some(184.2),
             http_status: None,
@@ -947,8 +947,8 @@ mod tests {
         );
 
         let outcome = SwitchOutcome {
-            requested: "hk01".into(),
-            installed: "hk01".into(),
+            requested: "ra01".into(),
+            installed: "ra01".into(),
             fallback: false,
         };
         assert!(
@@ -1187,7 +1187,7 @@ mod tests {
 files = ["/nonexistent-test.yaml"]
 
 [classes.dev]
-listen = "127.0.0.1:17879"
+listen = "127.0.0.1:20100"
 "#,
         )
         .unwrap();

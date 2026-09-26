@@ -98,7 +98,7 @@ pub const LEGACY_SUBSCRIPTION_NAME: &str = "default";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ClassConfig {
-    /// Loopback listen address for this class, e.g. 127.0.0.1:17878
+    /// Loopback listen address for this class, e.g. 127.0.0.1:20100
     pub listen: SocketAddr,
     /// Per-class override of the global [selection] policy. Only the keys set
     /// here take effect for this class; the rest inherit [selection]. This is
@@ -316,7 +316,7 @@ pub struct SelectionConfig {
     /// Node display-name substrings eligible for AUTOMATIC selection
     /// (initial activation, health-failure recovery, challenger-wins).
     /// Empty = all nodes. Manual switching via the control socket is never
-    /// restricted. e.g. `regions = ["🇭🇰"]`.
+    /// restricted. e.g. `regions = ["Region-A"]`.
     #[serde(default = "default_regions")]
     pub regions: Vec<String>,
     /// Automatic node switching without operator action. When false, a
@@ -536,7 +536,7 @@ impl Config {
     }
 
     /// Compact per-class policy summary for the dashboard strip, e.g.
-    /// "regions=hk,jp auto=off". Empty = inherits global [selection].
+    /// "regions=Region-A,Region-B auto=off". Empty = inherits global [selection].
     pub fn class_selection_summary(&self, class: &str) -> String {
         let Some(sel) = self.classes.get(class).and_then(|c| c.selection.as_ref()) else {
             return String::new();
@@ -1347,7 +1347,7 @@ mod tests {
 files = ["~/sub.yaml"]
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
 
     #[test]
@@ -1389,33 +1389,33 @@ listen = "127.0.0.1:17878"
 files = ["~/sub.yaml"]
 
 [selection]
-regions = ["Japan"]
+regions = ["Region-B"]
 auto_switch = true
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 
-[classes.telegram]
-listen = "127.0.0.1:17885"
+[classes.market]
+listen = "127.0.0.1:20110"
 
-[classes.telegram.selection]
-regions = ["🇭🇰", "香港"]
+[classes.market.selection]
+regions = ["Region-A", "Region-C"]
 auto_switch = false
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         // Unset override inherits the global policy.
-        assert_eq!(cfg.class_regions("dev"), &["Japan".to_string()]);
+        assert_eq!(cfg.class_regions("dev"), &["Region-B".to_string()]);
         assert!(cfg.class_auto_switch("dev"));
         assert_eq!(cfg.class_selection_summary("dev"), "");
         // Set override replaces only the keys it sets.
-        assert_eq!(cfg.class_regions("telegram"), &["🇭🇰".to_string(), "香港".to_string()]);
-        assert!(!cfg.class_auto_switch("telegram"));
+        assert_eq!(cfg.class_regions("market"), &["Region-A".to_string(), "Region-C".to_string()]);
+        assert!(!cfg.class_auto_switch("market"));
         assert_eq!(
-            cfg.class_selection_summary("telegram"),
-            "regions=🇭🇰,香港 auto=off"
+            cfg.class_selection_summary("market"),
+            "regions=Region-A,Region-C auto=off"
         );
         // Unknown class inherits global policy rather than failing.
-        assert_eq!(cfg.class_regions("nope"), &["Japan".to_string()]);
+        assert_eq!(cfg.class_regions("nope"), &["Region-B".to_string()]);
         assert!(cfg.validate().is_ok());
     }
 
@@ -1426,31 +1426,31 @@ auto_switch = false
 files = ["~/sub.yaml"]
 
 [health]
-url = "http://www.gstatic.com/generate_204"
+url = "http://health.test/generate_204"
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 
-[classes.telegram]
-listen = "127.0.0.1:17885"
+[classes.market]
+listen = "127.0.0.1:20110"
 
-[classes.telegram.health]
+[classes.market.health]
 url = "connect://api.example:443"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(
             cfg.class_health_url("dev"),
-            "http://www.gstatic.com/generate_204",
+            "http://health.test/generate_204",
             "unset override inherits the global target"
         );
         assert_eq!(
-            cfg.class_health_url("telegram"),
+            cfg.class_health_url("market"),
             "connect://api.example:443"
         );
         // Unknown class inherits global policy rather than failing.
         assert_eq!(
             cfg.class_health_url("nope"),
-            "http://www.gstatic.com/generate_204"
+            "http://health.test/generate_204"
         );
         assert!(cfg.validate().is_ok());
     }
@@ -1465,17 +1465,17 @@ files = ["~/sub.yaml"]
 samples = 2
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 
-[classes.telegram]
-listen = "127.0.0.1:17885"
+[classes.market]
+listen = "127.0.0.1:20110"
 
-[classes.telegram.health]
+[classes.market.health]
 url = "connect://api.example:443"
 samples = 5
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
-        assert_eq!(cfg.class_health_samples("telegram"), 5, "class override wins");
+        assert_eq!(cfg.class_health_samples("market"), 5, "class override wins");
         assert_eq!(
             cfg.class_health_samples("dev"),
             2,
@@ -1485,7 +1485,7 @@ samples = 5
         assert!(cfg.validate().is_ok());
 
         let minimal: Config = toml::from_str(
-            "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n",
+            "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:20100\"\n",
         )
         .unwrap();
         assert_eq!(
@@ -1500,14 +1500,14 @@ samples = 5
     fn health_samples_out_of_range_is_rejected() {
         for bad in ["samples = 0", "samples = 11"] {
             let text = format!(
-                "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[health]\n{bad}\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n"
+                "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[health]\n{bad}\n\n[classes.dev]\nlisten = \"127.0.0.1:20100\"\n"
             );
             let cfg: Config = toml::from_str(&text).unwrap();
             let err = cfg.validate().unwrap_err().to_string();
             assert!(err.contains("health.samples"), "{err}");
 
             let text = format!(
-                "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n\n[classes.dev.health]\nurl = \"connect://api.example:443\"\n{bad}\n"
+                "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:20100\"\n\n[classes.dev.health]\nurl = \"connect://api.example:443\"\n{bad}\n"
             );
             let cfg: Config = toml::from_str(&text).unwrap();
             let err = cfg.validate().unwrap_err().to_string();
@@ -1517,7 +1517,7 @@ samples = 5
 
     #[test]
     fn health_tick_budget_is_bounded_by_interval_and_absolute_cap() {
-        let base = "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:17878\"\n";
+        let base = "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:20100\"\n";
 
         // Default interval 30s / timeout 5s: 5 samples fit (5×6000=30000 ≤
         // 30000), 6 do not.
@@ -1580,7 +1580,7 @@ samples = 5
 files = ["~/sub.yaml"]
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 
 [classes.dev.health]
 url = "{bad}"
@@ -1602,7 +1602,7 @@ url = "{bad}"
 files = ["~/sub.yaml"]
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 
 [classes.dev.selection]
 regions = []
@@ -1677,7 +1677,7 @@ direct_hosts = ["MiMo.Example.com", "mimo.example.COM"]
 [subscriptions]
 files = ["/tmp/x.yaml"]
 [classes.bad]
-listen = "0.0.0.0:17878"
+listen = "0.0.0.0:20100"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err());
@@ -1689,9 +1689,9 @@ listen = "0.0.0.0:17878"
 [subscriptions]
 files = ["/tmp/x.yaml"]
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 [classes.browser]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         let error = cfg.validate().unwrap_err().to_string();
@@ -1706,9 +1706,9 @@ listen = "127.0.0.1:17878"
 [subscriptions]
 files = ["/tmp/x.yaml"]
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 [health]
-url = "https://www.gstatic.com/generate_204"
+url = "https://health.test/generate_204"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err());
@@ -1748,7 +1748,7 @@ url_file = "~/.config/causeway/remote.url"
 cache_file = "~/.local/share/causeway/subscriptions/remote.yaml"
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let mut cfg: Config = toml::from_str(text).unwrap();
         cfg.expand_paths();
@@ -1806,7 +1806,7 @@ files = ["/tmp/legacy.yaml"]
 files = ["/tmp/named.yaml"]
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg
@@ -1824,7 +1824,7 @@ files = ["/tmp/a.yaml"]
 [subscriptions.profiles.b]
 files = ["/tmp/b.yaml"]
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(missing).unwrap();
         assert!(cfg
@@ -1839,7 +1839,7 @@ default = "missing"
 [subscriptions.profiles.only]
 files = ["/tmp/a.yaml"]
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(unknown).unwrap();
         assert!(cfg
@@ -1855,7 +1855,7 @@ listen = "127.0.0.1:17878"
 [subscriptions.profiles.remote]
 url_file = "/tmp/remote.url"
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(without_cache).unwrap();
         assert!(cfg
@@ -1870,7 +1870,7 @@ files = ["/tmp/a.yaml"]
 url_file = "/tmp/remote.url"
 cache_file = "/tmp/cache.yaml"
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(mixed_source).unwrap();
         assert!(cfg
@@ -1886,7 +1886,7 @@ listen = "127.0.0.1:17878"
 [subscriptions.profiles."not a name"]
 files = ["/tmp/a.yaml"]
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg
@@ -1903,7 +1903,7 @@ listen = "127.0.0.1:17878"
 url_file = "/tmp/shared"
 cache_file = "/tmp/shared"
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(same_path).unwrap();
         assert!(cfg
@@ -1922,7 +1922,7 @@ cache_file = "/tmp/shared.yaml"
 url_file = "/tmp/b.url"
 cache_file = "/tmp/shared.yaml"
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(shared_cache).unwrap();
         assert!(cfg
@@ -1943,7 +1943,7 @@ files = ["/tmp/source.yaml"]
 url_file = "/tmp/remote.url"
 cache_file = "/tmp/a/../source.yaml"
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(source_conflict).unwrap();
         assert!(cfg
@@ -1958,7 +1958,7 @@ state_file = "/tmp/state.json"
 url_file = "/tmp/remote.url"
 cache_file = "/tmp/x/../state.json"
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#;
         let cfg: Config = toml::from_str(state_conflict).unwrap();
         assert!(cfg
@@ -1976,7 +1976,7 @@ log_dir = {log_dir:?}
 [subscriptions]
 files = [{source:?}]
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#
         );
         toml::from_str(&text).unwrap()
@@ -2010,7 +2010,7 @@ files = [{slot:?}]
 url_file = {url:?}
 cache_file = {cache:?}
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#,
             state = dir.join("state.json"),
             logs = dir.join("logs"),
@@ -2069,7 +2069,7 @@ log_dir = {logs:?}
 url_file = {url:?}
 cache_file = {cache:?}
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#,
             logs = dir.join("logs"),
             url = dir.join("missing.url"),
@@ -2127,7 +2127,7 @@ listen = "127.0.0.1:17878"
 url_file = {url_file:?}
 cache_file = {config_path:?}
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#,
             url_file = dir.join("missing.url")
         );
@@ -2180,7 +2180,7 @@ listen = "127.0.0.1:17878"
 url_file = {url_file:?}
 cache_file = {cache_file:?}
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#,
             cache_file = dir.join("cache.yaml")
         );

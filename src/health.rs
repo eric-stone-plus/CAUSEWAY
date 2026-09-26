@@ -355,9 +355,9 @@ mod tests {
 
     #[test]
     fn valid_target_accepts_both_forms_and_rejects_others() {
-        assert!(valid_target("http://www.gstatic.com/generate_204"));
+        assert!(valid_target("http://health.test/generate_204"));
         assert!(valid_target("connect://api.example:443"));
-        assert!(!valid_target("https://www.gstatic.com/generate_204"));
+        assert!(!valid_target("https://health.test/generate_204"));
         assert!(!valid_target("ftp://example/"));
         assert!(!valid_target("connect://api.example/path"));
     }
