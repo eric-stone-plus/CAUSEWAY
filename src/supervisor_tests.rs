@@ -61,6 +61,12 @@ struct FakePlane {
     /// differ from pool order on purpose) instead of hoping for
     /// scheduler jitter.
     delays: HashMap<String, u64>,
+    /// When set, `start` sends `true` on this sender immediately after
+    /// recording the start of the named node — a deterministic seam to inject
+    /// a shutdown signal mid-recovery, so a test can prove the between-
+    /// candidates shutdown check aborts the remaining tail (never a timing
+    /// race against a delayed responder).
+    shutdown_trigger: Option<(String, watch::Sender<bool>)>,
     trace: Arc<FakeTrace>,
 }
 
@@ -78,6 +84,7 @@ impl FakePlane {
             Self {
                 responses: Mutex::new(responses),
                 delays,
+                shutdown_trigger: None,
                 trace: Arc::clone(&trace),
             },
             trace,
@@ -158,6 +165,14 @@ impl DataPlane for FakePlane {
         );
         let node_name = spec.node.name().to_string();
         self.trace.starts.lock().unwrap().push(node_name.clone());
+        // Deterministic mid-recovery shutdown seam: signal drain_shutdown the
+        // instant the named node starts, so the between-candidates check sees
+        // it on the very next iteration (no responder-delay timing race).
+        if let Some((trigger, tx)) = &self.shutdown_trigger {
+            if *trigger == node_name {
+                let _ = tx.send(true);
+            }
+        }
         let delay_ms = self.delays.get(&node_name).copied().unwrap_or(0);
 
         let socks_addr = spec.socks_addr();
@@ -367,6 +382,7 @@ fn recovery_fixture(
         drain_grace_secs,
         label,
         HashMap::new(),
+        None,
     )
 }
 
@@ -379,6 +395,7 @@ fn recovery_fixture_with_delays(
     drain_grace_secs: u64,
     label: &str,
     delays: HashMap<String, u64>,
+    shutdown_trigger: Option<&str>,
 ) -> (
     Arc<Ctx>,
     Arc<tokio::sync::Mutex<ClassRuntime>>,
@@ -388,7 +405,13 @@ fn recovery_fixture_with_delays(
     let dir = test_dir(label);
     let cfg = test_config(dir.join("state.json"), drain_grace_secs);
     let catalog = cfg.subscriptions.clone();
-    let (plane, trace) = FakePlane::new_with_delays(responses, delays);
+    // Create the drain channel before the plane so an optional trigger can
+    // hold a sender clone and signal shutdown from inside start().
+    let (drain_shutdown, _) = watch::channel(false);
+    let (mut plane, trace) = FakePlane::new_with_delays(responses, delays);
+    if let Some(trigger_node) = shutdown_trigger {
+        plane.shutdown_trigger = Some((trigger_node.to_string(), drain_shutdown.clone()));
+    }
     let current = nodes
         .iter()
         .find(|candidate| candidate.name() == "current")
@@ -437,7 +460,6 @@ fn recovery_fixture_with_delays(
         auto_recovery: AutoRecoveryBackoff::default(),
         health_failures: 0,
     }));
-    let (drain_shutdown, _) = watch::channel(false);
     let ctx = Arc::new(Ctx {
         config_path: dir.join("config.toml"),
         subscriptions: Arc::new(RwLock::new(SubscriptionRuntime {
@@ -655,6 +677,49 @@ async fn failed_rebuild_keeps_old_route_handle_and_generation() {
         .snapshot()
         .iter()
         .any(|event| { matches!(event, control::Event::Switched { .. }) }));
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn recovery_in_progress_aborts_remaining_tail_on_shutdown() {
+    // Three alternates that all fail pre-check, then the incumbent rebuild.
+    // FakePlane signals drain_shutdown the instant the first alternate starts,
+    // so a recovery already in progress must abort its remaining tail instead
+    // of dragging <=MAX_SWITCH_CANDIDATES x (spawn + readiness + pre-check)
+    // (~90s worst case) past the drain deadline. The check sits BETWEEN
+    // candidates: the in-flight try_activate runs to completion and stops its
+    // own handle, so no adapter is orphaned by the abort.
+    let (ctx, class, trace, dir) = recovery_fixture_with_delays(
+        vec![node("current"), node("alt-a"), node("alt-b"), node("alt-c")],
+        [("alt-a", 503), ("alt-b", 503), ("alt-c", 503), ("current", 503)],
+        3,
+        3_600,
+        "recovery-shutdown-abort",
+        HashMap::new(),
+        Some("alt-a"),
+    );
+
+    let switched = switch_node_inner(&ctx, &class, "health-failures").await;
+
+    assert!(!switched, "recovery must not succeed once shutdown is requested");
+    // Only the first alternate started: alt-b and alt-c were skipped by the
+    // between-candidates check, and the incumbent rebuild was skipped by the
+    // pre-rebuild check. The whole tail after the shutdown signal never ran.
+    assert_eq!(trace.starts(), ["alt-a"]);
+    // The in-flight activation was never cancelled — alt-a's failed pre-check
+    // ran its Err path and stopped the handle (no orphaned adapter process).
+    assert_eq!(trace.stops(), ["candidate-0-alt-a"]);
+    // The incumbent is untouched: no switch, route generation unchanged, and
+    // nothing was installed so nothing drains.
+    let rt = class.lock().await;
+    assert_eq!(rt.active.as_ref().unwrap().handle.describe(), "incumbent-old");
+    assert_eq!(rt.route.read().unwrap().generation, 3);
+    drop(rt);
+    assert!(
+        ctx.draining.lock().await.is_empty(),
+        "no path was installed, so none drains"
+    );
 
     std::fs::remove_dir_all(dir).ok();
 }
@@ -2101,6 +2166,7 @@ async fn probe_now_results_follow_pool_order_not_completion_order() {
             ("late".to_string(), 400),
             ("last".to_string(), 100),
         ]),
+        None,
     );
     let (results, pool_total) = probe_now(&ctx, "dev").await;
     assert_eq!(pool_total, 4, "the pool denominator counts every node");

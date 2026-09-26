@@ -11,10 +11,11 @@
 //! write-lock assignment (an atomic flip invisible to clients).
 
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -134,6 +135,58 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// client that keeps a tunnel open.
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Minimum spacing between two `accept failed` warnings of the same error
+/// kind. The 22GB log storm (125,350,887 identical EMFILE lines) came from a
+/// tight accept() loop warning once per failure: a transient fd exhaustion
+/// became a disk-filling event. Throttling to one line per interval — each
+/// carrying the count suppressed since the previous line — bounds the bytes
+/// regardless of how fast accept() fails, while keeping the true rate visible.
+const ACCEPT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Rate-limits the per-class `accept failed` warning. Distinct error kinds
+/// always log immediately (a new failure mode must not hide behind an
+/// unrelated one being throttled); repeats of the same kind log at most once
+/// per [`ACCEPT_ERROR_LOG_INTERVAL`], reporting how many were suppressed.
+///
+/// The clock is injected (`observe` takes `now`) so the policy is unit-testable
+/// without real sleeps.
+struct AcceptErrorThrottle {
+    last_kind: Option<ErrorKind>,
+    suppressed: u64,
+    last_log: Instant,
+}
+
+impl AcceptErrorThrottle {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_kind: None,
+            suppressed: 0,
+            last_log: now,
+        }
+    }
+
+    /// Record an accept error of `kind` at time `now`. Returns `Some(n)` when
+    /// the caller should log now, where `n` is the number of same-kind failures
+    /// suppressed since the previous log (0 for a first-of-kind or the very
+    /// first error). Returns `None` when this error is throttled.
+    fn observe(&mut self, kind: ErrorKind, now: Instant) -> Option<u64> {
+        let same_kind = self.last_kind == Some(kind);
+        let interval_elapsed = now.saturating_duration_since(self.last_log) >= ACCEPT_ERROR_LOG_INTERVAL;
+        if same_kind && !interval_elapsed {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        // Logging now: a first-of-kind error reports 0 suppressed (the previous
+        // kind's tally is dropped — kind changes are rare inside a storm, which
+        // is one repeating kind, and bounding bytes beats bookkeeping a flush).
+        let suppressed = if same_kind { self.suppressed } else { 0 };
+        self.suppressed = 0;
+        self.last_kind = Some(kind);
+        self.last_log = now;
+        Some(suppressed)
+    }
+}
+
 pub async fn serve(
     class_name: String,
     listener: TcpListener,
@@ -166,6 +219,7 @@ async fn serve_with_drain_timeout(
     let local_addr = listener.local_addr()?;
     info!(class = %class_name, %local_addr, "listener started");
     let mut connections = JoinSet::new();
+    let mut accept_throttle = AcceptErrorThrottle::new(Instant::now());
     loop {
         // Bias a simultaneous accept/shutdown race toward closing admission.
         // The explicit pre-check also handles a receiver created after the
@@ -202,7 +256,19 @@ async fn serve_with_drain_timeout(
                             }
                         });
                     }
-                    Err(e) => warn!(class = %class_name, error = %e, "accept failed"),
+                    Err(e) => {
+                        // Throttle the warn! so a tight accept() failure loop
+                        // (e.g. EMFILE) cannot fill the disk; see
+                        // AcceptErrorThrottle. `suppressed` carries the count
+                        // hidden since the last logged line of this kind.
+                        if let Some(suppressed) = accept_throttle.observe(e.kind(), Instant::now()) {
+                            if suppressed > 0 {
+                                warn!(class = %class_name, error = %e, suppressed, "accept failed");
+                            } else {
+                                warn!(class = %class_name, error = %e, "accept failed");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -374,6 +440,46 @@ mod tests {
         assert!(counters.snapshot().is_empty());
         counters.add("beta", "shared-name", 1, 2);
         assert_eq!(counters.snapshot()["shared-name"].down, 2);
+    }
+
+    #[test]
+    fn accept_error_throttle_bounds_storm_and_surfaces_new_kinds() {
+        let t0 = Instant::now();
+        let mut th = AcceptErrorThrottle::new(t0);
+
+        // First error of a kind logs immediately with 0 suppressed.
+        assert_eq!(th.observe(ErrorKind::Other, t0), Some(0));
+
+        // Same kind inside the 5s interval is throttled; the tally grows.
+        assert_eq!(th.observe(ErrorKind::Other, t0 + Duration::from_secs(1)), None);
+        assert_eq!(th.observe(ErrorKind::Other, t0 + Duration::from_secs(2)), None);
+        assert_eq!(th.observe(ErrorKind::Other, t0 + Duration::from_secs(4)), None);
+
+        // At exactly the interval the next line logs and reports the tally.
+        assert_eq!(th.observe(ErrorKind::Other, t0 + Duration::from_secs(5)), Some(3));
+
+        // Tally resets after a log; throttling resumes for the new window.
+        assert_eq!(th.observe(ErrorKind::Other, t0 + Duration::from_secs(6)), None);
+
+        // A distinct kind logs immediately regardless of the interval, so a new
+        // failure mode never hides behind a throttled one.
+        assert_eq!(th.observe(ErrorKind::ConnectionReset, t0 + Duration::from_secs(6)), Some(0));
+        assert_eq!(th.observe(ErrorKind::ConnectionReset, t0 + Duration::from_secs(7)), None);
+        assert_eq!(th.observe(ErrorKind::ConnectionReset, t0 + Duration::from_secs(11)), Some(1));
+
+        // A kind-change log must also RESET the interval window: the next
+        // same-kind error is measured from the kind-change, not from the
+        // previous same-kind log. Without this a stale last_log would let the
+        // new kind log again before a full interval has elapsed (kills the
+        // THROTTLE-STALE-LASTLOG mutant: don't advance last_log on a
+        // kind-change log).
+        let mut th2 = AcceptErrorThrottle::new(t0);
+        assert_eq!(th2.observe(ErrorKind::Other, t0), Some(0));
+        assert_eq!(th2.observe(ErrorKind::ConnectionReset, t0 + Duration::from_secs(1)), Some(0));
+        // 4s after the kind-change log: still inside the window -> suppressed.
+        assert_eq!(th2.observe(ErrorKind::ConnectionReset, t0 + Duration::from_secs(5)), None);
+        // 5s after the kind-change log: window elapsed -> logs with the tally.
+        assert_eq!(th2.observe(ErrorKind::ConnectionReset, t0 + Duration::from_secs(6)), Some(1));
     }
 
     #[tokio::test]

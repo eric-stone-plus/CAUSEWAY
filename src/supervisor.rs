@@ -583,7 +583,20 @@ async fn try_candidates(
     candidates: &[Node],
     reason: &str,
 ) -> Option<String> {
+    // A recovery racing shutdown must not drag its full candidate tail past
+    // the drain deadline: up to MAX_SWITCH_CANDIDATES x (spawn + readiness +
+    // pre-check), which is tens of seconds at default timeouts and grows
+    // toward the ceiling if timeout_ms is raised. Check between candidates
+    // only — never cancel an in-flight try_activate: plane.start spawns the
+    // adapter before it returns the handle, so a mid-start cancel has no
+    // handle to stop and orphans the process. The worst case is one extra
+    // candidate finishing after shutdown is requested, not the whole tail.
+    let shutdown = ctx.drain_shutdown.subscribe();
     for cand in candidates {
+        if *shutdown.borrow() {
+            info!(class = %rt.name, reason, "path recovery aborted: shutdown requested");
+            return None;
+        }
         match try_activate(ctx, &rt.name, cand).await {
             Ok(active) => {
                 let name = active.node.name().to_string();
@@ -640,6 +653,14 @@ async fn switch_node_locked(ctx: &Arc<Ctx>, rt: &mut ClassRuntime, reason: &str)
 
     if !candidates.is_empty() && try_candidates(ctx, rt, &candidates, reason).await.is_some() {
         return true;
+    }
+
+    // Skip the last-resort rebuild (and its misleading "rebuilding" log) once
+    // shutdown is requested; try_candidates would abort at its first candidate
+    // anyway, but this keeps the trail honest.
+    if *ctx.drain_shutdown.subscribe().borrow() {
+        info!(class = %rt.name, reason, "path recovery aborted before current-node rebuild: shutdown requested");
+        return false;
     }
 
     if let Some(current_node) = current_node {

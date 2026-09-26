@@ -377,6 +377,22 @@ fn default_health_samples() -> u32 {
 /// measured-degradation envelope (10 samples × the default 5s timeout).
 const MAX_HEALTH_TICK_BUDGET_MS: u64 = 60_000;
 
+/// Sanity ceiling for one probe/health `interval_secs`. The tick budget below
+/// already couples `health.timeout_ms` to `interval_secs`, but `interval_secs`
+/// on its own had no upper bound — a typo (e.g. 30000000 for 30) silently
+/// turned the monitor off instead of failing loudly. One day is far above any
+/// plausible cadence, so it catches gross errors without rejecting a real
+/// config. This is hygiene, not overflow safety: the tick cap already uses
+/// saturating arithmetic, so a huge interval cannot panic or wrap.
+const MAX_INTERVAL_SECS: u64 = 86_400;
+
+/// Sanity ceiling for one connect/probe/health/site `timeout_ms`. Unlike the
+/// health timeout, `probe.timeout_ms` had no coupling at all (only `> 0`), so
+/// it could be set to an absurd value that never completes an actionable
+/// probe. 60s aligns with [`MAX_HEALTH_TICK_BUDGET_MS`]: a connectivity
+/// timeout above a minute is never useful for deciding whether a path is up.
+const MAX_TIMEOUT_MS: u64 = 60_000;
+
 /// Worst-case cost of one sampled health tick. Saturating: a malformed
 /// timeout_ms must reach an actionable bail, never an arithmetic panic
 /// (debug) or a silent wrap (release) that would smuggle an unbounded
@@ -668,11 +684,35 @@ impl Config {
         if self.probe.interval_secs == 0 || self.health.interval_secs == 0 {
             bail!("probe/health interval_secs must be > 0");
         }
+        if self.probe.interval_secs > MAX_INTERVAL_SECS {
+            bail!(
+                "probe.interval_secs must be <= {MAX_INTERVAL_SECS} (1 day), got {}",
+                self.probe.interval_secs
+            );
+        }
+        if self.health.interval_secs > MAX_INTERVAL_SECS {
+            bail!(
+                "health.interval_secs must be <= {MAX_INTERVAL_SECS} (1 day), got {}",
+                self.health.interval_secs
+            );
+        }
         if self.probe.concurrency == 0 {
             bail!("probe.concurrency must be >= 1");
         }
         if self.probe.timeout_ms == 0 || self.health.timeout_ms == 0 {
             bail!("probe/health timeout_ms must be > 0");
+        }
+        if self.probe.timeout_ms > MAX_TIMEOUT_MS {
+            bail!(
+                "probe.timeout_ms must be <= {MAX_TIMEOUT_MS} (60s), got {}",
+                self.probe.timeout_ms
+            );
+        }
+        if self.health.timeout_ms > MAX_TIMEOUT_MS {
+            bail!(
+                "health.timeout_ms must be <= {MAX_TIMEOUT_MS} (60s), got {}",
+                self.health.timeout_ms
+            );
         }
         if self.health.fail_threshold == 0 {
             bail!("health.fail_threshold must be >= 1");
@@ -722,6 +762,12 @@ impl Config {
         }
         if self.sites.timeout_ms == 0 {
             bail!("sites.timeout_ms must be > 0");
+        }
+        if self.sites.timeout_ms > MAX_TIMEOUT_MS {
+            bail!(
+                "sites.timeout_ms must be <= {MAX_TIMEOUT_MS} (60s), got {}",
+                self.sites.timeout_ms
+            );
         }
         if self.sites.max_candidates == 0 {
             bail!("sites.max_candidates must be >= 1");
@@ -1541,17 +1587,19 @@ samples = 5
                 .unwrap();
         assert!(cfg.validate().is_ok());
 
-        // Overflow must reach an actionable bail — never an arithmetic panic
-        // (debug) or a silent wrap (release) that smuggles the tick past the
-        // cap. TOML integers top out at i64::MAX; 10 × (i64::MAX + 1000)
-        // still overflows u64 and must saturate into rejection.
+        // A malformed huge timeout_ms must reach an actionable bail — never an
+        // arithmetic panic (debug) or a silent wrap (release). The upper-bound
+        // sanity check now intercepts i64::MAX before the tick-budget
+        // computation and names the field directly, so the saturating
+        // arithmetic in health_tick_budget_ms is defense-in-depth (unreachable
+        // via config while MAX_TIMEOUT_MS holds, but still correct if it rises).
         let cfg: Config = toml::from_str(&format!(
             "{base}\n[health]\ntimeout_ms = {}\nsamples = 10\n",
             i64::MAX
         ))
         .unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("tick budget"), "{err}");
+        assert!(err.contains("health.timeout_ms"), "{err}");
 
         // A per-class override inherits the same budget.
         let cfg: Config = toml::from_str(&format!(
@@ -1561,6 +1609,45 @@ samples = 5
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("classes.dev.health.samples"), "{err}");
         assert!(err.contains("tick budget"), "{err}");
+    }
+
+    #[test]
+    fn interval_and_timeout_upper_bounds_are_enforced() {
+        let base = "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:20100\"\n";
+
+        // Defaults sit far below the ceilings and must still validate.
+        assert!(toml::from_str::<Config>(base).unwrap().validate().is_ok());
+
+        // Ceiling-edge values are accepted: the bound is a sanity cap, not a
+        // tighter operational limit. health.timeout_ms stays at its default
+        // because the tick budget already caps it below MAX_TIMEOUT_MS, so
+        // 60000 there would trip the budget check first.
+        let edge = format!(
+            "{base}\n[probe]\ninterval_secs = 86400\ntimeout_ms = 60000\n\n[health]\ninterval_secs = 86400\n\n[sites]\ntimeout_ms = 60000\n"
+        );
+        assert!(
+            toml::from_str::<Config>(&edge).unwrap().validate().is_ok(),
+            "ceiling-edge values must pass"
+        );
+
+        // One past each ceiling is rejected with a message naming the field
+        // and the limit, so a typo is actionable rather than silent.
+        for (section, over, field, ceiling) in [
+            ("probe", "interval_secs = 86401", "probe.interval_secs", "86400"),
+            ("health", "interval_secs = 86401", "health.interval_secs", "86400"),
+            ("probe", "timeout_ms = 60001", "probe.timeout_ms", "60000"),
+            ("health", "timeout_ms = 60001", "health.timeout_ms", "60000"),
+            ("sites", "timeout_ms = 60001", "sites.timeout_ms", "60000"),
+        ] {
+            let text = format!("{base}\n[{section}]\n{over}\n");
+            let err = toml::from_str::<Config>(&text)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(field), "expected {field} in: {err}");
+            assert!(err.contains(ceiling), "expected ceiling {ceiling} in: {err}");
+        }
     }
 
     #[test]
