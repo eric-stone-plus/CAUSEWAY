@@ -1607,9 +1607,34 @@ mod tests {
         assert!(StdTcpListener::bind(reservation.socks_addr).is_err());
         assert!(StdTcpListener::bind(reservation.http_addr).is_err());
         let (socks_addr, http_addr) = reservation.release();
-        let socks = StdTcpListener::bind(socks_addr).unwrap();
-        let http = StdTcpListener::bind(http_addr).unwrap();
+        // Loopback close->rebind has a small kernel teardown window: close()
+        // returning does not mean the released port rebinds immediately
+        // (transient EADDRINUSE — the bind-side mirror of the listener-assert
+        // TOCTOU; in-suite sampling: ~0.04-0.06% of rebinds, max persisted
+        // window 42.9 ms, worst case needing the full 10-attempt budget at
+        // 5 ms). The FakePlane fixtures retry this too.
+        let socks = bind_retrying_addr_in_use(socks_addr);
+        let http = bind_retrying_addr_in_use(http_addr);
         drop((socks, http));
+    }
+
+    /// Retry transient `AddrInUse` until a wall-clock deadline (250 ms,
+    /// 5.8x the max window in the persisted campaigns); any other bind
+    /// error fails loudly.
+    fn bind_retrying_addr_in_use(addr: SocketAddr) -> StdTcpListener {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match StdTcpListener::bind(addr) {
+                Ok(listener) => return listener,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("bind {addr} stayed AddrInUse past the 250 ms deadline: {e}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("bind {addr}: {e}"),
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
