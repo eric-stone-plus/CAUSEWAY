@@ -153,8 +153,6 @@ pub async fn http_get_status_timed(
     Ok((code, t0.elapsed()))
 }
 
-
-
 /// Probe payload written into an established CONNECT tunnel: a minimal
 /// HTTP/1.0 GET. TLS-speaking edges answer it with a 4xx (measured: nginx on
 /// :443 replies "400 Bad Request" in ~0.5s); the content is never
@@ -409,8 +407,11 @@ mod tests {
                 // mode: "the checker wrote no probe" must be a recorded
                 // fact, not a fake-side assumption — otherwise the non-2xx
                 // pin below is true by construction and unfalsifiable.
+                // The window is deliberately generous (widened from 500 ms,
+                // audit backlog 12/R9): only the negative pins ever wait it
+                // out, and a scheduling stall must not fake "no probe".
                 if let Ok(Ok(m)) =
-                    tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await
+                    tokio::time::timeout(Duration::from_secs(1), sock.read(&mut buf)).await
                 {
                     if m > 0 {
                         probe = Some(buf[..m].to_vec());

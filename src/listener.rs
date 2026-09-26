@@ -316,6 +316,50 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::io::AsyncWriteExt;
 
+    /// Fixed-port bind for the two "admission is closed" asserts that probe
+    /// `connect(..)` AFTER the listener shut down (paired with the
+    /// bounded-retry refusal assert at the call sites). Two independent
+    /// re-take mechanisms made the original port-0 version flaky (~5% red
+    /// at 48 threads under load):
+    /// 1. The test's OWN socket: close() can return before the kernel
+    ///    finished destroying the listening socket, and a SYN in that
+    ///    window still completes — invariant to any port-allocation
+    ///    scheme, which is why the assert retries instead of probing once.
+    /// 2. Shared-namespace re-take: the kernel re-hands a released
+    ///    ephemeral port to any other port-0 bind in the suite, and a
+    ///    concurrent suite process can rebind a fixed one. The reserved
+    ///    sub-ranges lie outside `ip_local_port_range` (32768-60999), so
+    ///    mechanism 2's kernel side is eliminated outright.
+    ///
+    /// Each test gets a DISJOINT sub-range: a single shared range measurably
+    /// made things WORSE (1.7% -> 11.7% in interleaved A/B, 2026-09-26
+    /// review) because a sibling's scan deliberately re-takes the exact
+    /// port this test just released. The per-process start offset ROTATES
+    /// inside the sub-range (the scan set never leaves it, so sibling
+    /// ranges and /etc/services neighbors stay untouched); pid only
+    /// changes preference order across concurrent processes, and
+    /// `AddrInUse` try-next handles the residual overlap. The only
+    /// remaining cross-namespace actor is the SAME test in another
+    /// concurrent suite process — enumerated, and outlasted by the retry
+    /// budget at the assert.
+    async fn bind_reserved_test_listener(range: std::ops::Range<u16>) -> TcpListener {
+        let len = (range.end - range.start) as usize;
+        // The pid offset ROTATES inside the sub-range: the scan set always
+        // equals exactly this test's sub-range (never the sibling's, never
+        // an /etc/services-assigned neighbor); pid only changes preference
+        // order across concurrent processes.
+        let start = std::process::id() as usize % len;
+        for offset in 0..len {
+            let port = range.start + ((start + offset) % len) as u16;
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+                Ok(listener) => return listener,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => panic!("bind reserved test port {port}: {e}"),
+            }
+        }
+        panic!("no free port in the reserved test range {range:?}");
+    }
+
     #[test]
     fn traffic_is_reset_when_subscription_namespace_changes() {
         let counters = TrafficCounters::default();
@@ -334,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_closes_admission_and_joins_silent_connection() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener = bind_reserved_test_listener(20140..20150).await;
         let address = listener.local_addr().unwrap();
         let route = Arc::new(RwLock::new(ClassRoute::default()));
         let traffic = Arc::new(TrafficCounters::default());
@@ -366,7 +410,23 @@ mod tests {
             .expect("listener task does not panic")
             .expect("listener stops cleanly");
         assert_eq!(conns.load(Ordering::Relaxed), 0);
-        assert!(TcpStream::connect(address).await.is_err());
+        // Bounded-retry refusal: close() returning does not mean the kernel
+        // finished destroying OUR OWN listening socket — a SYN inside that
+        // teardown window still completes (netns-isolated instrumentation:
+        // at failure time the LISTEN inode is the test's own, unheld by any
+        // process, gone microseconds later; retries at +20/+40/+60 ms are
+        // always refused). A transient cross-process binder on the reserved
+        // port is outlasted the same way. A listener that never closed
+        // accepts for the whole ~500 ms budget and fails this assert.
+        let mut refused = false;
+        for _ in 0..100 {
+            if TcpStream::connect(address).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(refused, "listener still accepting after shutdown: {address}");
     }
 
     #[tokio::test]
@@ -433,7 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_requested_shutdown_never_opens_admission() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener = bind_reserved_test_listener(20150..20160).await;
         let address = listener.local_addr().unwrap();
         let route = Arc::new(RwLock::new(ClassRoute::default()));
         let traffic = Arc::new(TrafficCounters::default());
@@ -452,6 +512,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(conns.load(Ordering::Relaxed), 0);
-        assert!(TcpStream::connect(address).await.is_err());
+        // Bounded-retry refusal: close() returning does not mean the kernel
+        // finished destroying OUR OWN listening socket — a SYN inside that
+        // teardown window still completes (netns-isolated instrumentation:
+        // at failure time the LISTEN inode is the test's own, unheld by any
+        // process, gone microseconds later; retries at +20/+40/+60 ms are
+        // always refused). A transient cross-process binder on the reserved
+        // port is outlasted the same way. A listener that never closed
+        // accepts for the whole ~500 ms budget and fails this assert.
+        let mut refused = false;
+        for _ in 0..100 {
+            if TcpStream::connect(address).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(refused, "listener still accepting after shutdown: {address}");
     }
 }

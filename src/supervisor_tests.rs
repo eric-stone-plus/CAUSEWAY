@@ -1949,7 +1949,7 @@ async fn class_target_probe_verdicts_never_touch_the_shared_scores() {
             .collect()
     };
 
-    let results = probe_now(&ctx, "dev").await;
+    let (results, _pool_total) = probe_now(&ctx, "dev").await;
     assert_eq!(
         results.iter().map(|r| r.node.as_str()).collect::<Vec<_>>(),
         vec!["current", "alternate"],
@@ -2009,7 +2009,7 @@ async fn per_class_health_target_reaches_the_wire() {
 
     // On-demand probe through the class's effective target. The count
     // assertion keeps the all() honest: an empty recording would pass it.
-    let results = probe_now(&ctx, "dev").await;
+    let (results, _pool_total) = probe_now(&ctx, "dev").await;
     assert!(results.iter().all(|r| r.ok), "fake plane answers 204 to both forms");
     let requests = trace.requests();
     assert_eq!(
@@ -2044,7 +2044,7 @@ async fn per_class_health_target_reaches_the_wire() {
         0,
         "class-health-default",
     );
-    let results2 = probe_now(&ctx2, "dev").await;
+    let (results2, _pool_total) = probe_now(&ctx2, "dev").await;
     assert!(results2.iter().all(|r| r.ok));
     let requests2 = trace2.requests();
     assert_eq!(
@@ -2093,7 +2093,8 @@ async fn probe_now_results_follow_pool_order_not_completion_order() {
             ("last".to_string(), 100),
         ]),
     );
-    let results = probe_now(&ctx, "dev").await;
+    let (results, pool_total) = probe_now(&ctx, "dev").await;
+    assert_eq!(pool_total, 4, "the pool denominator counts every node");
     assert_eq!(
         results
             .iter()
@@ -2102,6 +2103,135 @@ async fn probe_now_results_follow_pool_order_not_completion_order() {
         vec![("current", true), ("middle", true), ("late", false), ("last", true)],
         "wrong orderings: completion [last, current, late, middle]; name [current, last, late, middle]; rtt-asc [last, current, middle, late]; rtt-desc [late, middle, current, last]; failures-first [late, current, middle, last]; successes-first [current, middle, last, late]"
     );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The panic-slot contract, pinned end-to-end through the control handler:
+/// a probe task that panics leaves its slot empty — the listing comes back
+/// SHORT with the hole collapsed and survivors in pool order — while the
+/// pool total still counts every node, so the on-demand `Probed` event
+/// reads "2 of 3 ok" instead of a false "2 of 2 ok" (audit backlog 15/16;
+/// the behavior was sandbox-demonstrated 2026-09-26 but never pinned).
+/// Mutation-verified: truncating the event total to `results.len()`,
+/// returning the short length as the pool total, or no-oping the panic
+/// injection each goes red on a distinct assert below.
+#[tokio::test]
+async fn panicked_probe_task_shortens_listing_but_not_the_pool_total() {
+    let (ctx, class, _trace, dir) = recovery_fixture(
+        vec![node("current"), node("victim-now"), node("third")],
+        // No plane-start entry for "victim-now": the injection panics the
+        // task BEFORE it starts a plane, so the FIFO responder queue must
+        // hold only the starts that will actually happen. (If the hook ever
+        // went no-op, victim's start would pop the queue head and fail the
+        // name ensure! as an Err verdict, and "third" would then panic on
+        // the empty queue — the listing assert below goes red either way.)
+        [("current", 204), ("third", 204)],
+        1,
+        0,
+        "probe-panic-slot",
+    );
+    // Key is test-unique: the hook is process-global, and a shared key
+    // would let the periodic twin's guard cancel this injection (B16-1).
+    let _injection = probe_panic_hook::Injection::new("victim-now");
+    let classes = Arc::new(HashMap::from([("dev".to_string(), class)]));
+    let reply = handle_control(
+        Arc::clone(&ctx),
+        classes,
+        control::Request::ProbeNow {
+            class: "dev".into(),
+        },
+    )
+    .await;
+
+    let results = reply.probe.expect("probe reply carries the listing");
+    assert_eq!(
+        results
+            .iter()
+            .map(|r| (r.node.as_str(), r.ok))
+            .collect::<Vec<_>>(),
+        vec![("current", true), ("third", true)],
+        "the panicked task's slot must collapse; survivors keep pool order"
+    );
+
+    let probed = ctx
+        .events
+        .snapshot()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            control::Event::Probed {
+                source, ok, total, ..
+            } if source == "on-demand" => Some((*ok, *total)),
+            _ => None,
+        })
+        .expect("on-demand Probed event recorded");
+    assert_eq!(
+        probed,
+        (2, 3),
+        "the event denominator must count the pool, not the returned rows"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Periodic-path twin of the on-demand panic-slot pin: `probe_all`'s
+/// JoinSet absorbs task panics the same way, so the periodic `Probed`
+/// event must take its denominator from the pool count, not the returned
+/// outcomes (same under-report class, caught by the consistency sweep of
+/// all three `Event::Probed` sites). The survivors probe a LIVE loopback
+/// target so the `ok` count discriminates: with the injection the event
+/// reads (2 ok, 3 total); without it, (3, 3); with a truncated
+/// denominator, (2, 2).
+#[tokio::test]
+async fn periodic_probed_event_total_counts_pool_when_a_task_panics() {
+    // Keep a real listener alive for the survivors to connect to; the
+    // victim never reaches its probe (the injection fires first).
+    let probe_target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe_target.local_addr().unwrap().port();
+    let live_node = |name: &str| {
+        Node::Ss(SsNode {
+            name: name.to_string(),
+            server: "127.0.0.1".to_string(),
+            port,
+            cipher: "aes-128-gcm".to_string(),
+            password: "test-only".to_string(),
+            plugin: None,
+        })
+    };
+    let (ctx, _class, _trace, dir) = recovery_fixture(
+        vec![
+            live_node("current"),
+            live_node("victim-cycle"),
+            live_node("third"),
+        ],
+        // probe_cycle never starts a data plane: no responder entries.
+        [],
+        1,
+        0,
+        "probe-cycle-total",
+    );
+    let _injection = probe_panic_hook::Injection::new("victim-cycle");
+    probe_cycle(&ctx, "test-cycle").await;
+
+    let probed = ctx
+        .events
+        .snapshot()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            control::Event::Probed {
+                source, ok, total, ..
+            } if source == "test-cycle" => Some((*ok, *total)),
+            _ => None,
+        })
+        .expect("periodic Probed event recorded");
+    assert_eq!(
+        probed,
+        (2, 3),
+        "survivors reach the live target; the denominator counts the pool"
+    );
+
+    drop(probe_target);
     std::fs::remove_dir_all(dir).ok();
 }
 

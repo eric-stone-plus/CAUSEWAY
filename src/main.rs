@@ -288,7 +288,7 @@ async fn cmd_probe(cfg: &config::Config, limit: Option<usize>) -> anyhow::Result
         cfg.probe.concurrency
     );
 
-    let outcomes = probe::probe_all(
+    let (outcomes, total) = probe::probe_all(
         nodes,
         std::time::Duration::from_millis(cfg.probe.timeout_ms),
         cfg.probe.concurrency,
@@ -297,7 +297,9 @@ async fn cmd_probe(cfg: &config::Config, limit: Option<usize>) -> anyhow::Result
 
     let mut ok: Vec<_> = outcomes.iter().filter(|o| o.rtt.is_some()).collect();
     ok.sort_by_key(|o| o.rtt.unwrap());
-    let failed = outcomes.len() - ok.len();
+    // Count a task lost to a panic as a failure: the pool total is the
+    // honest denominator, not the shortened outcome list.
+    let failed = total - ok.len();
 
     pln!("\n{:<50} {:>10}", "NODE", "RTT (ms)");
     for o in ok.iter().take(20) {
@@ -314,7 +316,7 @@ async fn cmd_probe(cfg: &config::Config, limit: Option<usize>) -> anyhow::Result
         "\nsummary: {} ok / {} failed / {} total",
         ok.len(),
         failed,
-        outcomes.len()
+        total
     );
     Ok(())
 }

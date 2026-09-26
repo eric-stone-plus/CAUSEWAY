@@ -1401,19 +1401,15 @@ async fn handle_control(
             if !classes.contains_key(&class) {
                 return control::Reply::err(format!("unknown class {class:?}"));
             }
-            let results = probe_now(&ctx, &class).await;
+            let (results, total) = probe_now(&ctx, &class).await;
             let ok = results.iter().filter(|r| r.ok).count();
             ctx.events.push(control::Event::Probed {
                 unix: state::now_unix(),
                 source: "on-demand".into(),
                 ok,
-                total: results.len(),
+                total,
             });
-            info!(
-                ok,
-                total = results.len(),
-                "on-demand end-to-end probe complete"
-            );
+            info!(ok, total, "on-demand end-to-end probe complete");
             control::Reply::ok_probe(results)
         }
         control::Request::Events => control::Reply::ok_events(ctx.events.snapshot()),
@@ -1680,7 +1676,8 @@ async fn switch_for_site(
 }
 
 /// End-to-end test of every node: fresh data plane on free ports, one
-/// generate_204 through its http port, EMAs recorded, never switches.
+/// probe through the class's effective health target (HTTP GET or CONNECT
+/// write-through), EMAs recorded, never switches.
 /// Bounded concurrency — every probe spawns a whole data-plane process.
 const PROBE_NOW_CONCURRENCY: usize = 8;
 
@@ -1689,10 +1686,12 @@ const PROBE_NOW_CONCURRENCY: usize = 8;
 /// control-protocol listing is deterministic for consumers, and positional
 /// assertions in tests stop racing task scheduling (a load-sensitive flake
 /// source, measured 2026-09-25). A panicked task leaves its slot empty —
-/// the listing is then short, which consumers already classify as
-/// incomplete. (Consumers must still key results by node name when talking
-/// to older daemons, which returned completion order.)
-async fn probe_now_inner(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResult> {
+/// the listing is then short — while the returned pool total still counts
+/// EVERY node, so consumers (and the on-demand `Probed` event) report
+/// "2 of 3 ok" instead of a false "2 of 2". (Consumers must still key
+/// results by node name when talking to older daemons, which returned
+/// completion order.)
+async fn probe_now_inner(ctx: &Arc<Ctx>, class: &str) -> (Vec<control::ProbeResult>, usize) {
     let nodes = pool(ctx);
     // Every pool node is tested, but through the REQUESTING class's
     // effective health target: an on-demand probe must answer the operator's
@@ -1718,6 +1717,8 @@ async fn probe_now_inner(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResul
         let health_url = health_url.clone();
         set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
+            #[cfg(test)]
+            probe_panic_hook::check(node.name());
             (idx, probe_now_node(&ctx, node, era, &health_url, record).await)
         });
     }
@@ -1729,13 +1730,75 @@ async fn probe_now_inner(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResul
             Err(e) => warn!(error = %format!("{e:#}"), "probe task panicked"),
         }
     }
-    slots.into_iter().flatten().collect()
+    let results = slots.into_iter().flatten().collect();
+    (results, total)
 }
 
-async fn probe_now(ctx: &Arc<Ctx>, class: &str) -> Vec<control::ProbeResult> {
-    let results = probe_now_inner(ctx, class).await;
+async fn probe_now(ctx: &Arc<Ctx>, class: &str) -> (Vec<control::ProbeResult>, usize) {
+    let outcome = probe_now_inner(ctx, class).await;
     save_state(ctx);
-    results
+    outcome
+}
+
+/// Test-only panic injection for the probe-task contract. No fixture input
+/// can make a real probe task panic — every failure mode of the fake data
+/// plane surfaces as an `Err` verdict, not a panic — yet the short-listing
+/// half of the contract (a panicked task collapses its slot while the pool
+/// total still counts it) is only reachable through one. The hook is the
+/// single injection point, compiled out of release builds entirely.
+#[cfg(test)]
+pub(crate) mod probe_panic_hook {
+    use std::sync::Mutex;
+
+    /// Node names whose next probe-task check must panic. This is
+    /// PROCESS-GLOBAL state shared by every test in the binary: each test
+    /// must use a key no other test uses, or one test's guard dropping
+    /// cancels the other's injection mid-flight — a cross-test race that is
+    /// invisible when each test runs alone (measured 6-11% red in
+    /// same-process pair runs with a shared key, 2026-09-26 review).
+    /// All accessors are poison-tolerant: [`check`] panics WITHOUT holding
+    /// the lock (its guard is an end-of-statement temporary), so the mutex
+    /// never poisons — but binding that guard to a variable would, so never
+    /// "simplify" the accessors into holding the lock across a panic.
+    pub static FLAGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// RAII injection scope: flags on construction, unflags on drop, so a
+    /// failing assert cannot leak the token into later tests. Bind it to a
+    /// NAME (`let _injection = Injection::new(..)`): `let _ =` drops the
+    /// guard immediately and silently disables the injection.
+    pub struct Injection(String);
+
+    impl Injection {
+        pub fn new(node: &str) -> Self {
+            let mut flagged = FLAGGED.lock().unwrap_or_else(|e| e.into_inner());
+            if !flagged.iter().any(|n| n == node) {
+                flagged.push(node.to_string());
+            }
+            drop(flagged);
+            Self(node.to_string())
+        }
+    }
+
+    impl Drop for Injection {
+        fn drop(&mut self) {
+            FLAGGED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|n| *n != self.0);
+        }
+    }
+
+    pub fn check(node: &str) {
+        // The guard dies at the end of this statement, before the panic.
+        let flagged = FLAGGED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|n| n == node);
+        if flagged {
+            panic!("injected probe-task panic for {node}");
+        }
+    }
 }
 
 /// One on-demand probe task body. The reconfiguration read gate is scoped to
@@ -1970,9 +2033,9 @@ async fn activate_initial(ctx: &Arc<Ctx>, class: &Arc<tokio::sync::Mutex<ClassRu
 /// One full probe cycle: update EMAs and persist.
 async fn probe_cycle_inner(ctx: &Ctx, source: &str) {
     let timeout = std::time::Duration::from_millis(ctx.cfg.probe.timeout_ms);
-    let outcomes = probe::probe_all(pool(ctx), timeout, ctx.cfg.probe.concurrency).await;
+    let (outcomes, total) =
+        probe::probe_all(pool(ctx), timeout, ctx.cfg.probe.concurrency).await;
     let ok = outcomes.iter().filter(|o| o.rtt.is_some()).count();
-    let total = outcomes.len();
     {
         let now = state::now_unix();
         let mut st = lock_state(&ctx.state);

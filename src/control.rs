@@ -392,6 +392,8 @@ pub enum Event {
         unix: i64,
         source: String,
         ok: usize,
+        /// Pool size at probe time; can exceed the length of a short
+        /// ProbeNow listing (a panicked probe task omits its row).
         total: usize,
     },
     /// Config reload attempt finished

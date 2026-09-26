@@ -40,7 +40,10 @@ pub async fn probe_one(server: &str, port: u16, timeout: Duration) -> Option<Dur
 }
 
 /// Probe all nodes concurrently, in arbitrary completion order; logs progress
-/// every 50 completions. Callers consume outcomes by node name (the startup
+/// every 50 completions. Returns (outcomes, POOL TOTAL): the JoinSet absorbs
+/// a panicking task, so the outcome list can come back short — the second
+/// element always counts every node, letting callers keep an honest
+/// denominator. Callers consume outcomes by node name (the startup
 /// and periodic cycles record EMAs per node; the `causeway probe` CLI sorts
 /// the successful outcomes by RTT and counts failures). Contrast the
 /// on-demand end-to-end probe (`supervisor::probe_now_inner`), whose
@@ -49,7 +52,7 @@ pub async fn probe_all(
     nodes: Vec<Node>,
     timeout: Duration,
     concurrency: usize,
-) -> Vec<ProbeOutcome> {
+) -> (Vec<ProbeOutcome>, usize) {
     let total = nodes.len();
     let done = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
@@ -60,6 +63,8 @@ pub async fn probe_all(
         let done = Arc::clone(&done);
         set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore is never closed");
+            #[cfg(test)]
+            crate::supervisor::probe_panic_hook::check(node.name());
             let rtt = probe_one(node.server(), node.port(), timeout).await;
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 50 == 0 || n == total {
@@ -76,5 +81,5 @@ pub async fn probe_all(
             Err(e) => tracing::warn!(error = %e, "probe task ended abnormally"),
         }
     }
-    out
+    (out, total)
 }

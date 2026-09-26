@@ -748,8 +748,14 @@ fn classify_probe_reply(
     match reply {
         Ok(reply) if reply.ok => match reply.probe {
             Some(results) => {
-                let total = results.len();
                 let ok = results.iter().filter(|result| result.ok).count();
+                // The honest denominator is the requested pool, not the
+                // returned rows: a panic-shortened listing must not render
+                // "2/2 ok" for a 3-node pool (same under-report class the
+                // daemon-side Probed event total was fixed for).
+                let total = requested_tag
+                    .as_ref()
+                    .map_or(results.len(), |tag| tag.pool.len());
                 let round = requested_tag.and_then(|tag| {
                     let mut by_node = BTreeMap::new();
                     for result in results {
@@ -3141,6 +3147,27 @@ listen = "127.0.0.1:20100"
             assert_eq!(outcome.level, MessageLevel::Warning);
             assert!(outcome.message.contains("ranking unchanged"));
         }
+    }
+
+    #[test]
+    fn incomplete_probe_message_denominator_counts_the_pool_not_the_rows() {
+        // A panic-shortened (or otherwise missing-row) listing must render
+        // "2/3 ok", not "2/2 ok": the denominator is the requested pool,
+        // the same under-report class fixed daemon-side in Probed.total.
+        let snap = tagged_snapshot("primary", 7, &["a", "b", "c"]);
+        let outcome = classify_probe_reply(
+            Ok(control::Reply::ok_probe(vec![
+                probe_result("a", Some(10.0)),
+                probe_result("b", Some(20.0)),
+            ])),
+            probe_round_tag(&snap),
+        );
+        assert!(outcome.round.is_none());
+        assert!(
+            outcome.message.contains("2/3 ok"),
+            "short listing must not shrink the denominator: {}",
+            outcome.message
+        );
     }
 
     #[test]
