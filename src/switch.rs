@@ -2898,7 +2898,7 @@ mod tests {
     fn app_for_order() -> App {
         App {
             cfg_classes: vec!["dev".into()],
-            listens: vec!["127.0.0.1:17878".into()],
+            listens: vec!["127.0.0.1:20100".into()],
             class_selections: vec![String::new()],
             class_idx: 0,
             state_file: PathBuf::from("/nonexistent"),
@@ -2956,7 +2956,7 @@ files = ["/test/primary.yaml"]
 files = ["/test/backup.yaml"]
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#,
         )
         .unwrap();
@@ -3059,14 +3059,14 @@ listen = "127.0.0.1:17878"
     #[test]
     fn ordered_names_does_not_freeze_on_vanishing_success_ema_lead() {
         let mut nodes = BTreeMap::new();
-        nodes.insert("jp-slow".into(), stats(0.999999992, Some(284.0), true));
-        nodes.insert("jp-fast".into(), stats(0.999999991, Some(46.0), true));
-        nodes.insert("hk".into(), stats(0.999999991, Some(50.0), true));
+        nodes.insert("rb-slow".into(), stats(0.999999992, Some(284.0), true));
+        nodes.insert("rb-fast".into(), stats(0.999999991, Some(46.0), true));
+        nodes.insert("ra".into(), stats(0.999999991, Some(50.0), true));
         let snap = snapshot(nodes);
 
         assert_eq!(
             ordered_names(Some(&snap), &[], None),
-            vec!["jp-fast", "hk", "jp-slow"],
+            vec!["rb-fast", "ra", "rb-slow"],
             "a 1e-10 success lead must not pin a slow node above faster ones"
         );
     }
@@ -3652,23 +3652,23 @@ listen = "127.0.0.1:17878"
     fn class_overviews_prefer_daemon_strip() {
         let mut app = app_for_order();
         app.cfg_classes = vec!["browser".into(), "dev".into()];
-        app.listens = vec!["127.0.0.1:17880".into(), "127.0.0.1:17878".into()];
+        app.listens = vec!["127.0.0.1:20120".into(), "127.0.0.1:20100".into()];
         app.class_idx = 1;
         let mut snap = snapshot(BTreeMap::new());
         snap.class = "dev".into();
-        snap.active_node = Some("hk-dev".into());
+        snap.active_node = Some("ra-dev".into());
         snap.classes = vec![
             control::ClassOverview {
                 name: "browser".into(),
-                listen: "127.0.0.1:17880".into(),
-                active_node: Some("jp-browser".into()),
+                listen: "127.0.0.1:20120".into(),
+                active_node: Some("rb-browser".into()),
                 generation: 4,
                 selection: String::new(),
             },
             control::ClassOverview {
                 name: "dev".into(),
-                listen: "127.0.0.1:17878".into(),
-                active_node: Some("hk-dev".into()),
+                listen: "127.0.0.1:20100".into(),
+                active_node: Some("ra-dev".into()),
                 generation: 9,
                 selection: String::new(),
             },
@@ -3677,28 +3677,28 @@ listen = "127.0.0.1:17878"
 
         let overviews = class_overviews(&app);
         assert_eq!(overviews.len(), 2);
-        assert_eq!(overviews[0].active_node.as_deref(), Some("jp-browser"));
-        assert_eq!(overviews[1].active_node.as_deref(), Some("hk-dev"));
+        assert_eq!(overviews[0].active_node.as_deref(), Some("rb-browser"));
+        assert_eq!(overviews[1].active_node.as_deref(), Some("ra-dev"));
     }
 
     #[test]
     fn class_overviews_synthesize_from_config_when_daemon_omits_strip() {
         let mut app = app_for_order();
         app.cfg_classes = vec!["browser".into(), "dev".into()];
-        app.listens = vec!["127.0.0.1:17880".into(), "127.0.0.1:17878".into()];
+        app.listens = vec!["127.0.0.1:20120".into(), "127.0.0.1:20100".into()];
         app.class_idx = 1;
         let mut snap = snapshot(BTreeMap::new());
         snap.class = "dev".into();
-        snap.active_node = Some("hk-dev".into());
+        snap.active_node = Some("ra-dev".into());
         snap.generation = 9;
         app.snapshot = Some(snap);
 
         let overviews = class_overviews(&app);
         assert_eq!(overviews[0].name, "browser");
-        assert_eq!(overviews[0].listen, "127.0.0.1:17880");
+        assert_eq!(overviews[0].listen, "127.0.0.1:20120");
         assert_eq!(overviews[0].active_node, None);
         assert_eq!(overviews[1].name, "dev");
-        assert_eq!(overviews[1].active_node.as_deref(), Some("hk-dev"));
+        assert_eq!(overviews[1].active_node.as_deref(), Some("ra-dev"));
         assert_eq!(overviews[1].generation, 9);
     }
 
@@ -4104,7 +4104,7 @@ listen = "127.0.0.1:17878"
     #[test]
     fn a_successful_subscription_change_clears_the_filter() {
         let mut app = app_for_order();
-        app.filter = Some("hk".into());
+        app.filter = Some("ra".into());
         app.filter_edit = true;
         let mut reply = control::Reply::ok();
         reply.subscription_switch = Some(control::SubscriptionSwitchOutcome {
@@ -4135,26 +4135,26 @@ listen = "127.0.0.1:17878"
     #[test]
     fn recommendation_ignores_the_active_filter() {
         let mut app = app_for_order();
-        let mut snap = tagged_snapshot("primary", 2, &["hk-2", "jp-1"]);
+        let mut snap = tagged_snapshot("primary", 2, &["ra-2", "rb-1"]);
         snap.nodes
-            .insert("hk-2".into(), stats(0.95, Some(40.0), true));
-        snap.nodes.insert("jp-1".into(), stats(0.90, Some(30.0), true));
+            .insert("ra-2".into(), stats(0.95, Some(40.0), true));
+        snap.nodes.insert("rb-1".into(), stats(0.90, Some(30.0), true));
         let round = valid_probe_round(
             probe_round_tag(&snap).unwrap(),
             vec![
-                probe_result("hk-2", Some(20.0)),
-                probe_result("jp-1", Some(30.0)),
+                probe_result("ra-2", Some(20.0)),
+                probe_result("rb-1", Some(30.0)),
             ],
         );
         app.snapshot = Some(snap.clone());
         app.subs = snap.available_nodes.clone();
         app.last_probe_round = Some(round);
-        app.filter = Some("jp".into());
+        app.filter = Some("rb".into());
         rebuild_order(&mut app);
-        assert_eq!(app.order, ["jp-1"], "the visible view is filtered");
+        assert_eq!(app.order, ["rb-1"], "the visible view is filtered");
         assert_eq!(
             recommended_node(&app),
-            Some("hk-2"),
+            Some("ra-2"),
             "the recommendation speaks about the whole pool"
         );
     }
@@ -4295,15 +4295,15 @@ listen = "127.0.0.1:17878"
     #[test]
     fn filter_narrows_the_table_and_keeps_selection_identity() {
         let mut app = app_for_order();
-        app.subs = vec!["jp-1".into(), "hk-2".into(), "sg-3".into()];
+        app.subs = vec!["rb-1".into(), "ra-2".into(), "rc-3".into()];
         rebuild_order(&mut app);
         assert_eq!(app.order.len(), 3);
-        app.selected = 1; // hk-2
-        app.filter = Some("HK".into()); // case-insensitive match
+        app.selected = 1; // ra-2
+        app.filter = Some("RA".into()); // case-insensitive match
         rebuild_order(&mut app);
-        assert_eq!(app.order, ["hk-2"]);
+        assert_eq!(app.order, ["ra-2"]);
         assert_eq!(app.order_full.len(), 3);
-        assert_eq!(app.order[app.selected], "hk-2");
+        assert_eq!(app.order[app.selected], "ra-2");
         app.filter = None;
         rebuild_order(&mut app);
         assert_eq!(app.order.len(), 3);
@@ -4312,19 +4312,19 @@ listen = "127.0.0.1:17878"
     #[test]
     fn filter_edit_keys_commit_and_clear() {
         let mut app = app_for_order();
-        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        app.subs = vec!["rb-1".into(), "ra-2".into()];
         app.filter_edit = true;
-        for c in "hk".chars() {
+        for c in "ra".chars() {
             filter_edit_key(&mut app, KeyCode::Char(c));
         }
-        assert_eq!(app.filter.as_deref(), Some("hk"));
-        assert_eq!(app.order, ["hk-2"]);
+        assert_eq!(app.filter.as_deref(), Some("ra"));
+        assert_eq!(app.order, ["ra-2"]);
 
         filter_edit_key(&mut app, KeyCode::Enter);
         assert!(!app.filter_edit);
         assert_eq!(
             app.filter.as_deref(),
-            Some("hk"),
+            Some("ra"),
             "Enter commits, keeping the filter active"
         );
 
@@ -4339,9 +4339,9 @@ listen = "127.0.0.1:17878"
     fn footer_shows_the_live_filter_while_editing() {
         let mut app = app_for_order();
         app.filter_edit = true;
-        app.filter = Some("jp".into());
+        app.filter = Some("rb".into());
         let (message, color) = footer_message(&app);
-        assert!(message.contains("filter: jp"));
+        assert!(message.contains("filter: rb"));
         assert_eq!(color, tokens::ACCENT);
     }
 
@@ -4367,10 +4367,10 @@ listen = "127.0.0.1:17878"
 
     #[test]
     fn proxy_export_line_targets_the_focused_gateway() {
-        let line = proxy_export_line("127.0.0.1:17878");
-        assert!(line.starts_with("export http_proxy=http://127.0.0.1:17878"));
-        assert!(line.contains("https_proxy=http://127.0.0.1:17878"));
-        assert!(line.contains("all_proxy=socks5h://127.0.0.1:17878"));
+        let line = proxy_export_line("127.0.0.1:20100");
+        assert!(line.starts_with("export http_proxy=http://127.0.0.1:20100"));
+        assert!(line.contains("https_proxy=http://127.0.0.1:20100"));
+        assert!(line.contains("all_proxy=socks5h://127.0.0.1:20100"));
     }
 
     // ---- lane wiring: counts, starvation, overlap, closed-channel ----
@@ -4455,15 +4455,15 @@ listen = "127.0.0.1:17878"
         let socket = PathBuf::from("/nonexistent-causeway-test.sock");
         let mut app = app_for_order();
         app.cfg_classes = vec!["dev".into(), "browser".into()];
-        app.listens = vec!["127.0.0.1:17878".into(), "127.0.0.1:17880".into()];
+        app.listens = vec!["127.0.0.1:20100".into(), "127.0.0.1:20120".into()];
         app.class_selections = vec![String::new(), String::new()];
-        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        app.subs = vec!["rb-1".into(), "ra-2".into()];
         rebuild_order(&mut app);
 
         // Tab/←/→ — class focus: state reset, epoch supersede, filter gone.
         app.epoch = 7;
         app.status_flight = Some(flight_for(None, "dev", 7));
-        app.filter = Some("hk".into());
+        app.filter = Some("ra".into());
         assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Tab), KeyAction::None);
         assert_eq!(app.class(), "browser");
         assert_eq!(app.epoch, 8);
@@ -4472,14 +4472,14 @@ listen = "127.0.0.1:17878"
         assert!(app.last_refresh.elapsed() >= REFRESH_EVERY);
 
         // k/j move the selection (no snapshot: plain name order).
-        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        app.subs = vec!["rb-1".into(), "ra-2".into()];
         rebuild_order(&mut app);
-        assert_eq!(app.order, ["hk-2", "jp-1"]);
+        assert_eq!(app.order, ["ra-2", "rb-1"]);
         app.selected = 0;
         assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('j')), KeyAction::None);
-        assert_eq!(app.order[app.selected], "jp-1");
+        assert_eq!(app.order[app.selected], "rb-1");
         assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('k')), KeyAction::None);
-        assert_eq!(app.order[app.selected], "hk-2");
+        assert_eq!(app.order[app.selected], "ra-2");
 
         // t submits an end-to-end probe on the mutation lane.
         assert_eq!(dashboard_key(&mut app, &socket, KeyCode::Char('t')), KeyAction::None);
@@ -4523,7 +4523,7 @@ listen = "127.0.0.1:17878"
     async fn class_switching_is_blocked_while_a_mutation_runs() {
         let mut app = app_for_order();
         app.cfg_classes = vec!["dev".into(), "browser".into()];
-        app.listens = vec!["127.0.0.1:17878".into(), "127.0.0.1:17880".into()];
+        app.listens = vec!["127.0.0.1:20100".into(), "127.0.0.1:20120".into()];
         let socket = PathBuf::from("/nonexistent-causeway-test.sock");
         app.subs = vec!["a".into()];
         rebuild_order(&mut app);
@@ -4598,10 +4598,10 @@ listen = "127.0.0.1:17878"
         let mut snap = snapshot(BTreeMap::new());
         snap.classes = vec![control::ClassOverview {
             name: "dev".into(),
-            listen: "127.0.0.1:17878".into(),
-            active_node: Some("hk01".into()),
+            listen: "127.0.0.1:20100".into(),
+            active_node: Some("ra01".into()),
             generation: 3,
-            selection: "regions=HK auto=off".into(),
+            selection: "regions=RA auto=off".into(),
         }];
         app.snapshot = Some(snap);
         app.connected = true;
@@ -4613,15 +4613,15 @@ listen = "127.0.0.1:17878"
         let rendered = terminal_text(&terminal);
         assert!(rendered.contains("STALE"), "yellow band shows STALE: {rendered}");
         assert!(
-            rendered.contains("regions=HK"),
+            rendered.contains("regions=RA"),
             "daemon-supplied selection policy is visible: {rendered}"
         );
 
         // Filtered title with an honest narrowed/total count.
         app.last_live = Some(Instant::now());
-        app.filter = Some("hk".into());
-        app.order = vec!["hk-2".into()];
-        app.order_full = vec!["hk-2".into(), "jp-1".into(), "sg-3".into()];
+        app.filter = Some("ra".into());
+        app.order = vec!["ra-2".into()];
+        app.order_full = vec!["ra-2".into(), "rb-1".into(), "rc-3".into()];
         terminal.draw(|f| ui(f, &app)).unwrap();
         let rendered = terminal_text(&terminal);
         assert!(
@@ -4648,14 +4648,14 @@ listen = "127.0.0.1:17878"
     #[test]
     fn rebuild_order_clamps_selection_when_the_filter_hides_it() {
         let mut app = app_for_order();
-        app.subs = vec!["jp-1".into(), "hk-2".into()];
+        app.subs = vec!["rb-1".into(), "ra-2".into()];
         rebuild_order(&mut app);
-        app.selected = 1; // hk-2
-        app.filter = Some("jp".into());
+        app.selected = 1; // ra-2
+        app.filter = Some("rb".into());
         rebuild_order(&mut app);
-        assert_eq!(app.order, ["jp-1"]);
+        assert_eq!(app.order, ["rb-1"]);
         assert_eq!(
-            app.order[app.selected], "jp-1",
+            app.order[app.selected], "rb-1",
             "selection clamps into the filtered view"
         );
     }

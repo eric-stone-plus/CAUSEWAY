@@ -65,13 +65,13 @@ cache_file = "~/.local/share/causeway/subscriptions/remote-backup.yaml"
 # The dashboard shows every class at once; Enter switches only the focused
 # class so a scrape rotation cannot move interactive traffic.
 [classes.browser]
-listen = "127.0.0.1:17880"      # interactive browser traffic
+listen = "127.0.0.1:20120"      # interactive browser traffic
 
 [classes.dev]
-listen = "127.0.0.1:17878"      # development traffic
+listen = "127.0.0.1:20100"      # development traffic
 
 [classes.market]
-listen = "127.0.0.1:17879"      # market-data traffic
+listen = "127.0.0.1:20110"      # market-data traffic
 
 # Optional per-class override of the global [selection] policy (commented
 # example below). Only the keys set here take effect for this class; the
@@ -83,7 +83,7 @@ listen = "127.0.0.1:17879"      # market-data traffic
 # zero pool nodes fails the refresh for all classes (old paths keep
 # serving; fix or drop the override to refresh).
 # [classes.market.selection]
-# regions = ["HK"]               # omit to inherit [selection].regions
+# regions = ["Region-A"]               # omit to inherit [selection].regions
 # auto_switch = false            # omit to inherit [selection].auto_switch
 #
 # Optional per-class health target: the class's health loop, candidate
@@ -141,7 +141,7 @@ ema_alpha = 0.3                # EMA smoothing factor
 regions = []                   # node display-name substrings eligible for AUTOMATIC
                                # selection only (initial activation, health-failure
                                # recovery, challenger-wins); empty = all nodes.
-                               # Manual switching is never restricted. e.g. ["🇭🇰"]
+                               # Manual switching is never restricted. e.g. ["Region-A"]
 auto_switch = true             # false = a working active node never moves on its own:
                                # health-failure recovery and challenger-wins only log.
                                # Establishing a path when no node is active stays

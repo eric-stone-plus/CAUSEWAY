@@ -302,7 +302,7 @@ fn test_config(state_file: PathBuf, drain_grace_secs: u64) -> Config {
 files = ["/test/unused.yaml"]
 
 [classes.dev]
-listen = "127.0.0.1:17878"
+listen = "127.0.0.1:20100"
 "#,
     )
     .unwrap();
@@ -418,7 +418,7 @@ fn recovery_fixture_with_delays(
     }));
     let class = Arc::new(tokio::sync::Mutex::new(ClassRuntime {
         name: "dev".to_string(),
-        listen_addr: "127.0.0.1:17878".parse().unwrap(),
+        listen_addr: "127.0.0.1:20100".parse().unwrap(),
         route,
         active: Some(ActiveNode {
             node: current,
@@ -1617,7 +1617,7 @@ fn reload_shape_accepts_only_subscription_changes() {
     candidate.singbox_bin.push("different");
     changed.push(candidate);
     let mut candidate = running.clone();
-    candidate.classes.get_mut("dev").unwrap().listen = "127.0.0.1:17879".parse().unwrap();
+    candidate.classes.get_mut("dev").unwrap().listen = "127.0.0.1:20130".parse().unwrap();
     changed.push(candidate);
     let mut candidate = running.clone();
     candidate.probe.interval_secs += 1;
@@ -1639,14 +1639,14 @@ fn reload_shape_accepts_only_subscription_changes() {
 #[test]
 fn profile_candidates_region_filter_covers_preferred_probed_and_unknown() {
     let nodes = vec![
-        node("🇭🇰 Hong Kong丨01"),
-        node("🇯🇵 Japan丨01"),
-        node("🇯🇵 Japan丨02"),
+        node("Region-A丨01"),
+        node("Region-B丨01"),
+        node("Region-B丨02"),
     ];
     let stats = BTreeMap::from([
-        ("🇭🇰 Hong Kong丨01".to_string(), stats(0.5, Some(500.0))),
-        ("🇯🇵 Japan丨01".to_string(), stats(0.99, Some(50.0))),
-        // Japan丨02 stays unprobed.
+        ("Region-A丨01".to_string(), stats(0.5, Some(500.0))),
+        ("Region-B丨01".to_string(), stats(0.99, Some(50.0))),
+        // Region-B丨02 stays unprobed.
     ]);
 
     // The preferred incumbent, the higher-scoring probed node, and the
@@ -1654,31 +1654,31 @@ fn profile_candidates_region_filter_covers_preferred_probed_and_unknown() {
     let ordered = profile_candidates(
         &nodes,
         Some(&stats),
-        Some("🇯🇵 Japan丨01"),
-        &["🇭🇰".to_string()],
+        Some("Region-B丨01"),
+        &["Region-A".to_string()],
     );
     let names: Vec<_> = ordered.iter().map(Node::name).collect();
-    assert_eq!(names, ["🇭🇰 Hong Kong丨01"]);
+    assert_eq!(names, ["Region-A丨01"]);
 
-    let unfiltered = profile_candidates(&nodes, Some(&stats), Some("🇯🇵 Japan丨01"), &[]);
+    let unfiltered = profile_candidates(&nodes, Some(&stats), Some("Region-B丨01"), &[]);
     assert_eq!(unfiltered.len(), 3, "empty allowlist keeps the whole pool");
 }
 
 #[tokio::test]
 async fn initial_activation_respects_region_allowlist() {
     // state.json records the incumbent (fixture node "current", standing
-    // in for a Japan node) as the preferred node, but the region
-    // allowlist only admits Hong Kong: initial activation must skip the
+    // in for a Region-B node) as the preferred node, but the region
+    // allowlist only admits Region-A: initial activation must skip the
     // out-of-allowlist incumbent instead of reinstalling it.
     let (ctx, class, trace, dir) = recovery_fixture(
-        vec![node("current"), node("🇭🇰 Hong Kong丨01")],
-        [("🇭🇰 Hong Kong丨01", 204)],
+        vec![node("current"), node("Region-A丨01")],
+        [("Region-A丨01", 204)],
         1,
         0,
         "initial-regions",
     );
     let mut ctx = ctx;
-    Arc::get_mut(&mut ctx).unwrap().cfg.selection.regions = vec!["🇭🇰".to_string()];
+    Arc::get_mut(&mut ctx).unwrap().cfg.selection.regions = vec!["Region-A".to_string()];
     {
         let mut rt = class.lock().await;
         rt.active = None;
@@ -1686,7 +1686,7 @@ async fn initial_activation_respects_region_allowlist() {
     activate_initial(&ctx, &class).await;
     assert_eq!(
         trace.starts(),
-        vec!["🇭🇰 Hong Kong丨01".to_string()],
+        vec!["Region-A丨01".to_string()],
         "initial activation must not try the out-of-allowlist incumbent"
     );
     let installed = class
@@ -1695,7 +1695,7 @@ async fn initial_activation_respects_region_allowlist() {
         .active
         .as_ref()
         .map(|a| a.node.name().to_string());
-    assert_eq!(installed.as_deref(), Some("🇭🇰 Hong Kong丨01"));
+    assert_eq!(installed.as_deref(), Some("Region-A丨01"));
     stop_draining(&ctx).await;
     std::fs::remove_dir_all(dir).ok();
 }
@@ -1703,12 +1703,12 @@ async fn initial_activation_respects_region_allowlist() {
 #[tokio::test]
 async fn initial_activation_respects_per_class_region_override() {
     // Global [selection].regions stays EMPTY (would admit any node), but the
-    // class carries [classes.<name>.selection] with a Hong Kong-only
+    // class carries [classes.<name>.selection] with a Region-A-only
     // allowlist: the class-scoped override must skip the out-of-allowlist
     // incumbent even though global policy would have admitted it.
     let (ctx, class, trace, dir) = recovery_fixture(
-        vec![node("current"), node("🇭🇰 Hong Kong丨01")],
-        [("🇭🇰 Hong Kong丨01", 204)],
+        vec![node("current"), node("Region-A丨01")],
+        [("Region-A丨01", 204)],
         1,
         0,
         "initial-class-regions",
@@ -1720,7 +1720,7 @@ async fn initial_activation_respects_per_class_region_override() {
         .get_mut("dev")
         .unwrap()
         .selection = Some(crate::config::ClassSelection {
-        regions: Some(vec!["🇭🇰".to_string()]),
+        regions: Some(vec!["Region-A".to_string()]),
         auto_switch: None,
     });
     {
@@ -1730,7 +1730,7 @@ async fn initial_activation_respects_per_class_region_override() {
     activate_initial(&ctx, &class).await;
     assert_eq!(
         trace.starts(),
-        vec!["🇭🇰 Hong Kong丨01".to_string()],
+        vec!["Region-A丨01".to_string()],
         "initial activation must not try the node outside the class allowlist"
     );
     let installed = class
@@ -1739,7 +1739,7 @@ async fn initial_activation_respects_per_class_region_override() {
         .active
         .as_ref()
         .map(|a| a.node.name().to_string());
-    assert_eq!(installed.as_deref(), Some("🇭🇰 Hong Kong丨01"));
+    assert_eq!(installed.as_deref(), Some("Region-A丨01"));
     stop_draining(&ctx).await;
     std::fs::remove_dir_all(dir).ok();
 }
@@ -1750,9 +1750,9 @@ fn ranked_candidates_region_filter_restricts_automatic_pool() {
     let cfg = test_config(dir.join("state.json"), 10);
     let _catalog = cfg.subscriptions.clone();
     let nodes = vec![
-        node("🇭🇰 Hong Kong丨01"),
-        node("🇭🇰 Hong Kong丨02"),
-        node("🇯🇵 Japan丨01"),
+        node("Region-A丨01"),
+        node("Region-A丨02"),
+        node("Region-B丨01"),
     ];
     let mut state = StateFile::default();
     state.activate_subscription(LEGACY_SUBSCRIPTION_NAME);
@@ -1763,9 +1763,9 @@ fn ranked_candidates_region_filter_restricts_automatic_pool() {
     }
     let all = ranked_candidates(&nodes, &state, &[]);
     assert_eq!(all.len(), 3, "no filter keeps the whole pool");
-    let hk_only = ranked_candidates(&nodes, &state, &["🇭🇰".to_string()]);
-    assert_eq!(hk_only.len(), 2);
-    assert!(hk_only.iter().all(|n| n.name().contains("🇭🇰")));
+    let region_a_only = ranked_candidates(&nodes, &state, &["Region-A".to_string()]);
+    assert_eq!(region_a_only.len(), 2);
+    assert!(region_a_only.iter().all(|n| n.name().contains("Region-A")));
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -1835,7 +1835,7 @@ fn health_streak_is_class_local_when_classes_share_a_node() {
     );
     let mut dev = tokio::sync::Mutex::new(ClassRuntime {
         name: "dev".into(),
-        listen_addr: "127.0.0.1:17878".parse().unwrap(),
+        listen_addr: "127.0.0.1:20100".parse().unwrap(),
         route: Arc::new(RwLock::new(ClassRoute::default())),
         active: None,
         auto_recovery: AutoRecoveryBackoff::default(),
@@ -1850,7 +1850,7 @@ fn health_streak_is_class_local_when_classes_share_a_node() {
     dev.get_mut().active = Some(incumbent);
     let mut browser = tokio::sync::Mutex::new(ClassRuntime {
         name: "browser".into(),
-        listen_addr: "127.0.0.1:17880".parse().unwrap(),
+        listen_addr: "127.0.0.1:20120".parse().unwrap(),
         route: Arc::new(RwLock::new(ClassRoute::default())),
         active: Some(ActiveNode {
             node: shared,
