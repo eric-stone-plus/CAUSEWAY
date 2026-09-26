@@ -140,6 +140,81 @@ fn remove_socket_if_owned(path: &Path, expected: SocketIdentity) -> anyhow::Resu
 const LIVENESS_CONFIRMATIONS: usize = 5;
 const LIVENESS_RECHECK_DELAY: Duration = Duration::from_millis(50);
 
+/// Classifies a liveness-connect error: Refused and Reset both mean
+/// "nobody is listening" (fall to the stale path); everything else is a
+/// reason to bail conservatively. Reset is the teardown window's sibling
+/// of Refused: a dying socket can answer a connect and then reset it
+/// (captured 2x in 160k instrumented product-path binds on the
+/// reduced-confirmation arms). Extracted as a pure function so the
+/// classification table itself is pinnable — ECONNRESET cannot be forced
+/// on demand over AF_UNIX (0 hits in 24k synchronous first-connects; the
+/// captures were race-born).
+fn is_stale_signal(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Test seam for the identity recheck in [`remove_stale_control_socket`]:
+/// the recheck happens mid-function with no natural interleaving point,
+/// so pins register a path-keyed action that fires exactly once at the
+/// seam (after the stale signal, before the re-inspection).
+/// PROCESS-GLOBAL like every test hook: keys are [`test_socket_path`]
+/// values (pid + atomic sequence), so no two tests can register the same
+/// path; fire-once removal plus the RAII [`Injection`] drop keep the
+/// registry clean across failing asserts. Accessors are poison-tolerant
+/// and never hold the lock across a call into test code.
+#[cfg(test)]
+pub(crate) mod stale_check_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    type Action = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<Vec<(PathBuf, Action)>> = Mutex::new(Vec::new());
+
+    fn lock() -> std::sync::MutexGuard<'static, Vec<(PathBuf, Action)>> {
+        HOOKS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RAII injection scope: registers on construction, deregisters on
+    /// drop. Bind it to a NAME (`let _injection = Injection::new(..)`):
+    /// `let _ =` drops the guard immediately and silently disables the
+    /// injection.
+    pub struct Injection(PathBuf);
+
+    impl Injection {
+        /// Registers one action for `path`. Keys are unique by construction
+        /// (a [`test_socket_path`] per test), so there is no dedup guard:
+        /// registering twice for one path would make [`Drop`] (which retains
+        /// by path) clear both — one Injection per path, one path per test.
+        pub fn new(path: &Path, action: impl FnOnce() + Send + 'static) -> Self {
+            lock().push((path.to_path_buf(), Box::new(action)));
+            Self(path.to_path_buf())
+        }
+    }
+
+    impl Drop for Injection {
+        fn drop(&mut self) {
+            lock().retain(|(p, _)| *p != self.0);
+        }
+    }
+
+    /// Fires the hook registered for exactly this path, at most once.
+    /// The action runs AFTER the lock is released; test code must not
+    /// re-enter the registry.
+    pub fn fire_after_stale_signal(path: &Path) {
+        let action = {
+            let mut hooks = lock();
+            let index = hooks.iter().position(|(p, _)| p == path);
+            index.map(|i| hooks.remove(i).1)
+        };
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
+
 async fn remove_stale_control_socket(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     let metadata = match std::fs::symlink_metadata(path) {
@@ -170,33 +245,28 @@ async fn remove_stale_control_socket(path: &Path) -> anyhow::Result<()> {
                 }
                 tokio::time::sleep(LIVENESS_RECHECK_DELAY).await;
             }
-            // Refused AND reset both mean "nobody is listening": a socket
-            // mid-teardown can answer a connect and then reset it (captured
-            // 2x in 160k instrumented product-path binds on the
-            // reduced-confirmation arms). The blast radius is bounded: a
-            // same-state-file double start is refused earlier by the daemon
-            // flock, and the identity recheck below still gates removal.
-            // Any other error stays a conservative bail.
-            Ok(Err(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
-                ) => {
-                    let current = std::fs::symlink_metadata(path).with_context(|| {
-                        format!("re-inspect stale control socket {}", path.display())
-                    })?;
-                    if !current.file_type().is_socket()
-                        || SocketIdentity::from_metadata(&current) != identity
-                    {
-                        bail!(
-                            "control socket {} changed while checking it; refusing to remove it",
-                            path.display()
-                        );
-                    }
-                    return std::fs::remove_file(path).with_context(|| {
-                        format!("remove stale control socket {}", path.display())
-                    });
+            // Stale signal (refused or reset — see [`is_stale_signal`]).
+            // The blast radius is bounded: a same-state-file double start
+            // is refused earlier by the daemon flock, and the identity
+            // recheck below still gates removal.
+            Ok(Err(error)) if is_stale_signal(&error) => {
+                #[cfg(test)]
+                stale_check_hook::fire_after_stale_signal(path);
+                let current = std::fs::symlink_metadata(path).with_context(|| {
+                    format!("re-inspect stale control socket {}", path.display())
+                })?;
+                if !current.file_type().is_socket()
+                    || SocketIdentity::from_metadata(&current) != identity
+                {
+                    bail!(
+                        "control socket {} changed while checking it; refusing to remove it",
+                        path.display()
+                    );
                 }
+                return std::fs::remove_file(path).with_context(|| {
+                    format!("remove stale control socket {}", path.display())
+                });
+            }
             Ok(Err(error)) => {
                 return Err(error).with_context(|| {
                     format!(
@@ -1163,6 +1233,125 @@ mod tests {
         );
         server.await.unwrap();
         remove_test_socket(&path);
+    }
+
+    /// The identity recheck is the TOCTOU safety net: between the stale
+    /// signal and the removal, the file at this path may have been
+    /// REPLACED by a different socket (a racing daemon that just bound its
+    /// own) — removing it would unlink a live socket. There is no natural
+    /// interleaving point mid-function, so the pin swaps the file at
+    /// exactly that seam through the path-keyed [`stale_check_hook`].
+    /// Mutant-verified: deleting the identity recheck (NORECHECK) lets the
+    /// removal proceed and this test goes red on the unwrap_err.
+    #[tokio::test]
+    async fn identity_recheck_refuses_to_remove_a_swapped_socket() {
+        let path = test_socket_path("swapped");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A socket file nobody listens on: bound, then dropped. Sleep past
+        // the kernel teardown window (persisted max 112 ms) so the first
+        // liveness connect is deterministically refused instead of
+        // transiently accepted.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // At the seam, a competitor replaces the stale file with its own
+        // fresh socket. A std UnixListener does not unlink its path on
+        // drop, so the NEW inode is still on disk for the recheck to catch.
+        // The recheck discriminates on SocketIdentity = (dev, ino): the
+        // swap is detected because the recreate gets a different inode
+        // (measured 0 reuse across 2000 unlink+recreate cycles on tmpfs
+        // /tmp; on ext4 an immediate inode reuse would be a false-negative,
+        // but tmpfs is the test environment and reuse there is not observed).
+        let competitor = path.clone();
+        let _injection = super::stale_check_hook::Injection::new(&path, move || {
+            std::fs::remove_file(&competitor).ok();
+            drop(std::os::unix::net::UnixListener::bind(&competitor).unwrap());
+        });
+
+        let error = remove_stale_control_socket(&path).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("changed while checking it"),
+            "a swapped socket must be refused, not removed: {error:#}"
+        );
+        assert!(path.exists(), "the competitor's socket must survive");
+        remove_test_socket(&path);
+    }
+
+    /// The stale-signal classification table, pinned in BOTH directions:
+    /// exactly the two "nobody is listening" kinds (Refused, Reset) fall to
+    /// the stale path, and every other stable kind keeps the conservative
+    /// bail. The whitelist in [`is_stale_signal`] is fail-safe by
+    /// construction (any unlisted kind bails), so the load-bearing assert
+    /// is the COMPLEMENT — a mutant that WIDENS the whitelist (e.g. adds
+    /// NetworkUnreachable, which is exactly the ENETUNREACH a loopback
+    /// connect returns when the interface is down) would otherwise survive
+    /// the suite while silently eroding "never remove a live socket".
+    /// Mutant-verified both ways: RESETDROP (narrowing) and the ADDKIND
+    /// widening mutants (NetworkUnreachable / Interrupted / OutOfMemory)
+    /// each reddens exactly this test. The behavioral reset path cannot be
+    /// forced deterministically on AF_UNIX, so the table is the pin.
+    #[test]
+    fn stale_signal_classification_is_exactly_refused_and_reset() {
+        use std::io::ErrorKind;
+        let stale = |kind| is_stale_signal(&std::io::Error::from(kind));
+        assert!(stale(ErrorKind::ConnectionRefused), "the classic stale signal");
+        assert!(
+            stale(ErrorKind::ConnectionReset),
+            "a connect answered then reset is the same teardown window"
+        );
+        // Hand-maintained cover of every ErrorKind variant stable at MSRV
+        // 1.85 (38 total; the two whitelisted kinds are asserted above, so
+        // 36 negatives here). ErrorKind is #[non_exhaustive], so the compiler
+        // cannot check this list — re-audit it when the MSRV rises. The
+        // io_error_more batch (HostUnreachable, NetworkDown, NetworkUnreachable,
+        // NotADirectory, ReadOnlyFilesystem, ResourceBusy, StaleNetworkFileHandle,
+        // TooManyLinks) stabilized in 1.83; QuotaExceeded and CrossesDevices in
+        // 1.85. Kinds nightly-only at MSRV 1.85 (FilesystemLoop, InProgress,
+        // TooManyOpenFiles, Uncategorized) are deliberately omitted;
+        // InvalidFilename stabilized in 1.87, above the floor — table it when
+        // the MSRV rises. Any kind not listed falls to the fail-safe
+        // conservative bail, so an omission weakens this pin's completeness
+        // claim, never the runtime's safety.
+        for kind in [
+            ErrorKind::AddrInUse,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::AlreadyExists,
+            ErrorKind::ArgumentListTooLong,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::CrossesDevices,
+            ErrorKind::Deadlock,
+            ErrorKind::DirectoryNotEmpty,
+            ErrorKind::ExecutableFileBusy,
+            ErrorKind::FileTooLarge,
+            ErrorKind::HostUnreachable,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidData,
+            ErrorKind::InvalidInput,
+            ErrorKind::IsADirectory,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::NotADirectory,
+            ErrorKind::NotConnected,
+            ErrorKind::NotSeekable,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+            ErrorKind::OutOfMemory,
+            ErrorKind::PermissionDenied,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::ResourceBusy,
+            ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::StorageFull,
+            ErrorKind::TimedOut,
+            ErrorKind::TooManyLinks,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Unsupported,
+            ErrorKind::WouldBlock,
+            ErrorKind::WriteZero,
+        ] {
+            assert!(!stale(kind), "{kind:?} must stay a conservative bail");
+        }
     }
 
     #[test]

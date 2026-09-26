@@ -168,23 +168,32 @@ impl DataPlane for FakePlane {
         drop(spec);
         // Loopback port release→rebind has a small TOCTOU window (the
         // reservation is dropped just above, mirroring the real adapter
-        // boundary); retry transient EADDRINUSE instead of failing the test.
-        let listener = {
-            let mut last_err = None;
-            let mut bound = None;
-            for _ in 0..10 {
-                match tokio::net::TcpListener::bind(http_addr).await {
-                    Ok(l) => {
-                        bound = Some(l);
-                        break;
+        // boundary): the released port can transiently refuse to rebind.
+        // Same shape as dataplane's bind_retrying_addr_in_use (kept in sync
+        // by hand — sync #[test] there panics, this async fn returns Err).
+        // The old fixed 10x5 ms budget was exactly CONSUMED by the largest
+        // persisted in-sample window (42.9 ms → success on attempt 10/10);
+        // the 250 ms wall-clock deadline is ~5.8x that, pure headroom. This
+        // is hardening, not a proven fix: a fresh 24k-sample probe at this
+        // exact boundary found 0 budget exhaustions (max 25.8 ms), and the
+        // 1/40 loaded-netns "all candidates failed to activate" flake was
+        // never attributable — supervisor.rs's aggregated bail discards the
+        // per-candidate cause. Only transient AddrInUse is retryable; any
+        // other bind error fails the start immediately (no retry-loop).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let listener = loop {
+            match tokio::net::TcpListener::bind(http_addr).await {
+                Ok(listener) => break listener,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(anyhow::anyhow!(
+                            "bind fake plane {http_addr} stayed AddrInUse past the 250 ms deadline: {e}"
+                        ));
                     }
-                    Err(e) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        last_err = Some(e);
-                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
+                Err(e) => return Err(anyhow::anyhow!("bind fake plane {http_addr}: {e}")),
             }
-            bound.ok_or_else(|| anyhow::anyhow!("bind fake plane {http_addr}: {:?}", last_err))?
         };
         let trace = Arc::clone(&self.trace);
         let server = tokio::spawn(async move {

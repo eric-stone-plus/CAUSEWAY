@@ -1612,7 +1612,9 @@ mod tests {
         // (transient EADDRINUSE — the bind-side mirror of the listener-assert
         // TOCTOU; in-suite sampling: ~0.04-0.06% of rebinds, max persisted
         // window 42.9 ms, worst case needing the full 10-attempt budget at
-        // 5 ms). The FakePlane fixtures retry this too.
+        // 5 ms). The FakePlane responder bind in supervisor_tests.rs retries
+        // the same window with the same 250 ms deadline (kept in sync by
+        // hand — that one is async and returns Err; this one panics).
         let socks = bind_retrying_addr_in_use(socks_addr);
         let http = bind_retrying_addr_in_use(http_addr);
         drop((socks, http));
