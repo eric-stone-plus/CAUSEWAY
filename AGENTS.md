@@ -19,6 +19,14 @@ cargo clippy           # before committing (not a hard gate)
   **justify every new dependency** — KISS.
 - Toolchain/mirror config (if any) belongs in `~/.cargo/config.toml`, never in
   the repo.
+- Sandboxed runs (`unshare -rn …`) must bring loopback up first:
+  `unshare -rn sh -c 'ip link set lo up; cargo test --locked --all-features'`.
+  A bare `unshare -rn` leaves `lo` DOWN: binds still succeed, most loopback
+  tests then fail fast client-side (`ENETUNREACH`), but a test that tolerates
+  a failed probe goes on to join its fake server and blocks forever in
+  `accept`. Those joins are timeout-guarded (`join_server`, 10s), so the whole
+  suite fails visibly in ~10s instead of hanging — it still needs `lo` UP to
+  pass.
 
 ## Design red lines (violation = rejection)
 

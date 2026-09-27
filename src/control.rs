@@ -888,6 +888,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// Test-only join guard for spawned fake servers: see the health.rs twin.
+    /// This one guards a UnixListener fake, so a hang here means the liveness
+    /// connect never arrived — not a loopback problem.
+    async fn join_server(task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("control fake server did not finish within 10s (liveness connect never came?)")
+            .unwrap();
+    }
+
     static TEST_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn test_socket_path(label: &str) -> PathBuf {
@@ -1231,7 +1241,7 @@ mod tests {
             !path.exists(),
             "a listener that died mid-confirmation is stale and must be removed"
         );
-        server.await.unwrap();
+        join_server(server).await;
         remove_test_socket(&path);
     }
 

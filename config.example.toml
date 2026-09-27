@@ -114,14 +114,15 @@ listen = "127.0.0.1:20110"      # market-data traffic
 [probe]
 interval_secs = 600            # periodic re-probe interval (default 10 minutes; max 86400 = 1 day)
 timeout_ms = 3000              # per-probe TCP connect timeout (max 60000 = 60s)
-concurrency = 32               # bounded concurrency, no hammering
+concurrency = 32               # bounded concurrency, no hammering (max 1024)
 
 [health]
 interval_secs = 30             # full-path health check interval for the active route (max 86400 = 1 day)
 timeout_ms = 5000              # per-check timeout (max 60000 = 60s, and see the tick budget rule below)
-fail_threshold = 3             # N consecutive failures trigger a switch
+fail_threshold = 3             # N consecutive failures trigger a switch (max 100)
 url = "http://www.gstatic.com/generate_204"   # must be plaintext http://
-drain_grace_secs = 10          # minimum old-path grace; active pipes may extend it within a hard cap
+drain_grace_secs = 10          # minimum old-path grace (max 3600 = 1h);
+                               # pipes may extend it within a hard cap
 # samples = 1                  # probes per tick, all must pass (any-fail), 1..=10.
                                # Field degradation is bursty (measured 3-23%
                                # per-probe failure rates on affected nodes
@@ -152,9 +153,9 @@ auto_switch = true             # false = a working active node never moves on it
 # advisory only; they never affect health scoring.
 [sites]
 # timeout_ms = 8000            # per-site HTTPS probe timeout (max 60000 = 60s)
-# max_candidates = 5
-# verdict_ttl_secs = 1800
+# max_candidates = 5           # nodes probed per freeze switch (max 64)
+# verdict_ttl_secs = 1800      # cached verdict freshness (max 86400 = 1 day)
 # user_agent = "Mozilla/5.0 ..."
 
-[sites.list."www.cnbc.com"]
-url = "https://www.cnbc.com/markets/"
+[sites.list."www.example.com"]
+url = "https://www.example.com/markets/"

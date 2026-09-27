@@ -574,15 +574,18 @@ async fn install_active(ctx: &Ctx, rt: &mut ClassRuntime, new_active: ActiveNode
 }
 
 /// Try candidates in order, installing the first that passes its pre-check.
-/// Returns the installed node name (None = all failed, status quo kept).
-/// A failed activation records a probe failure so scoring quickly reflects
-/// that the node is currently unreachable.
+/// `Ok` is the installed node name. `Err` carries the last candidate's
+/// failure cause (`"node: error"`) so callers keep the aggregated
+/// bail/error trail diagnosable instead of swallowing it; the payload is
+/// `None` when no candidate was ever attempted (shutdown abort or empty
+/// pool). A failed activation records a probe failure so scoring quickly
+/// reflects that the node is currently unreachable.
 async fn try_candidates(
     ctx: &Ctx,
     rt: &mut ClassRuntime,
     candidates: &[Node],
     reason: &str,
-) -> Option<String> {
+) -> Result<String, Option<String>> {
     // A recovery racing shutdown must not drag its full candidate tail past
     // the drain deadline: up to MAX_SWITCH_CANDIDATES x (spawn + readiness +
     // pre-check), which is tens of seconds at default timeouts and grows
@@ -592,18 +595,20 @@ async fn try_candidates(
     // handle to stop and orphans the process. The worst case is one extra
     // candidate finishing after shutdown is requested, not the whole tail.
     let shutdown = ctx.drain_shutdown.subscribe();
+    let mut last_cause: Option<String> = None;
     for cand in candidates {
         if *shutdown.borrow() {
             info!(class = %rt.name, reason, "path recovery aborted: shutdown requested");
-            return None;
+            return Err(last_cause);
         }
         match try_activate(ctx, &rt.name, cand).await {
             Ok(active) => {
                 let name = active.node.name().to_string();
                 install_active(ctx, rt, active, reason).await;
-                return Some(name);
+                return Ok(name);
             }
             Err(e) => {
+                last_cause = Some(format!("{}: {e:#}", cand.name()));
                 warn!(class = %rt.name, node = %cand.name(), error = %format!("{e:#}"), "candidate activation failed, trying next");
                 // Same shared-EMA rule as the probe path: a pre-check
                 // verdict against a class-specific target says nothing about
@@ -624,7 +629,7 @@ async fn try_candidates(
             }
         }
     }
-    None
+    Err(last_cause)
 }
 
 /// The automatic recovery flow: try other scored nodes first, then rebuild
@@ -651,8 +656,12 @@ async fn switch_node_locked(ctx: &Arc<Ctx>, rt: &mut ClassRuntime, reason: &str)
         (candidates, current_node)
     };
 
-    if !candidates.is_empty() && try_candidates(ctx, rt, &candidates, reason).await.is_some() {
-        return true;
+    let mut last_cause: Option<String> = None;
+    if !candidates.is_empty() {
+        match try_candidates(ctx, rt, &candidates, reason).await {
+            Ok(_) => return true,
+            Err(cause) => last_cause = cause,
+        }
     }
 
     // Skip the last-resort rebuild (and its misleading "rebuilding" log) once
@@ -665,19 +674,36 @@ async fn switch_node_locked(ctx: &Arc<Ctx>, rt: &mut ClassRuntime, reason: &str)
 
     if let Some(current_node) = current_node {
         info!(class = %rt.name, node = %current_node.name(), reason, "rebuilding current node after alternate candidates failed");
-        if try_candidates(
+        match try_candidates(
             ctx,
             rt,
             std::slice::from_ref(&current_node),
             "path-recovery",
         )
         .await
-        .is_some()
         {
-            return true;
+            Ok(_) => return true,
+            // The rebuild's own failure is the freshest cause; keep the
+            // alternate-candidate cause only if no candidate was attempted.
+            Err(cause) => last_cause = cause.or(last_cause),
         }
     }
-    error!(class = %rt.name, reason, "all candidates and current-node rebuild failed, keeping current path");
+    // The headline must not claim candidates failed when none was ever
+    // attempted (an empty pool with no incumbent, or a shutdown landing just
+    // past the check above).
+    match &last_cause {
+        Some(cause) => error!(
+            class = %rt.name,
+            reason,
+            error = %cause,
+            "all candidates and current-node rebuild failed, keeping current path"
+        ),
+        None => error!(
+            class = %rt.name,
+            reason,
+            "no candidate was attempted, keeping current path"
+        ),
+    }
     false
 }
 
@@ -759,15 +785,20 @@ async fn switch_to(
             fallback: false,
         });
     }
-    if let Some(installed) =
-        try_candidates(ctx, &mut rt, std::slice::from_ref(&node), "manual").await
-    {
-        return Ok(control::SwitchOutcome {
-            requested: requested.to_string(),
-            installed,
-            fallback: false,
-        });
-    }
+    // The requested node's own cause is kept as the fallback report: when the
+    // score-ordered pool below is empty (small pool, or every other node is
+    // the incumbent), it is the only failure the caller can be told about.
+    let requested_cause =
+        match try_candidates(ctx, &mut rt, std::slice::from_ref(&node), "manual").await {
+            Ok(installed) => {
+                return Ok(control::SwitchOutcome {
+                    requested: requested.to_string(),
+                    installed,
+                    fallback: false,
+                })
+            }
+            Err(cause) => cause,
+        };
     // Requested node failed pre-check: fall back by score, excluding both the
     // failed request and the current node. Manual switching is never
     // restricted by the region allowlist, so the fallback pool is unfiltered.
@@ -781,12 +812,19 @@ async fn switch_to(
             .collect()
     };
     match try_candidates(ctx, &mut rt, &candidates, "manual").await {
-        Some(installed) => Ok(control::SwitchOutcome {
+        Ok(installed) => Ok(control::SwitchOutcome {
             requested: requested.to_string(),
             installed,
             fallback: true,
         }),
-        None => anyhow::bail!("all candidates failed to activate, keeping current path"),
+        // Same honesty rule as the recovery trail: only claim candidates
+        // failed when one actually was attempted.
+        Err(last_cause) => match last_cause.or(requested_cause) {
+            Some(cause) => anyhow::bail!(
+                "all candidates failed to activate, keeping current path (last failure: {cause})"
+            ),
+            None => anyhow::bail!("no candidate was attempted, keeping current path"),
+        },
     }
 }
 

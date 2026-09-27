@@ -393,6 +393,38 @@ const MAX_INTERVAL_SECS: u64 = 86_400;
 /// timeout above a minute is never useful for deciding whether a path is up.
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
+/// Sanity ceiling for `health.drain_grace_secs`. It had no validation at
+/// all: a typo (e.g. 36000 for 3600) would retain every retired data plane
+/// — child process, ports and fds — for that long, extendable by
+/// `RETIRED_PATH_MAX_EXTENSION` while captured pipes remain. It cannot
+/// stall a switch (`schedule_drain_with` spawns the drain task and returns)
+/// or a shutdown (`stop_draining` pre-empts the grace via `drain_shutdown`),
+/// so the harm is retention, not a hang. One hour is far above any plausible
+/// drain window.
+const MAX_DRAIN_GRACE_SECS: u64 = 3600;
+
+/// Sanity ceiling for `sites.verdict_ttl_secs`. An absurd TTL makes cached
+/// freeze verdicts effectively immortal, silently disabling the probe-first
+/// automation `switch --for-site` depends on. Aligned with
+/// [`MAX_INTERVAL_SECS`]: a verdict older than a day is never fresh.
+const MAX_VERDICT_TTL_SECS: u64 = 86_400;
+
+/// Sanity ceiling for `health.fail_threshold`, which counts consecutive
+/// health failures before automatic recovery engages; an absurd value
+/// silently disables recovery, unlike `selection.auto_switch = false`, which
+/// is an explicit decision.
+const MAX_FAIL_THRESHOLD: u32 = 100;
+
+/// Sanity ceiling for `probe.concurrency`, which directly sizes the
+/// concurrent probe-task/fd fan-out; absurd values burn resources with no
+/// upside, since the pool size already bounds the useful work.
+const MAX_PROBE_CONCURRENCY: usize = 1024;
+
+/// Sanity ceiling for `sites.max_candidates`, which sizes how many nodes a
+/// freeze switch may probe in one sweep; like [`MAX_PROBE_CONCURRENCY`], the
+/// pool bounds the useful work, so this only catches gross typos.
+const MAX_SITE_CANDIDATES: usize = 64;
+
 /// Worst-case cost of one sampled health tick. Saturating: a malformed
 /// timeout_ms must reach an actionable bail, never an arithmetic panic
 /// (debug) or a silent wrap (release) that would smuggle an unbounded
@@ -699,6 +731,12 @@ impl Config {
         if self.probe.concurrency == 0 {
             bail!("probe.concurrency must be >= 1");
         }
+        if self.probe.concurrency > MAX_PROBE_CONCURRENCY {
+            bail!(
+                "probe.concurrency must be <= {MAX_PROBE_CONCURRENCY}, got {}",
+                self.probe.concurrency
+            );
+        }
         if self.probe.timeout_ms == 0 || self.health.timeout_ms == 0 {
             bail!("probe/health timeout_ms must be > 0");
         }
@@ -716,6 +754,18 @@ impl Config {
         }
         if self.health.fail_threshold == 0 {
             bail!("health.fail_threshold must be >= 1");
+        }
+        if self.health.fail_threshold > MAX_FAIL_THRESHOLD {
+            bail!(
+                "health.fail_threshold must be <= {MAX_FAIL_THRESHOLD}, got {}",
+                self.health.fail_threshold
+            );
+        }
+        if self.health.drain_grace_secs > MAX_DRAIN_GRACE_SECS {
+            bail!(
+                "health.drain_grace_secs must be <= {MAX_DRAIN_GRACE_SECS} (1h), got {}",
+                self.health.drain_grace_secs
+            );
         }
         if !(1..=10).contains(&self.health.samples) {
             bail!(
@@ -771,6 +821,18 @@ impl Config {
         }
         if self.sites.max_candidates == 0 {
             bail!("sites.max_candidates must be >= 1");
+        }
+        if self.sites.max_candidates > MAX_SITE_CANDIDATES {
+            bail!(
+                "sites.max_candidates must be <= {MAX_SITE_CANDIDATES}, got {}",
+                self.sites.max_candidates
+            );
+        }
+        if self.sites.verdict_ttl_secs > MAX_VERDICT_TTL_SECS {
+            bail!(
+                "sites.verdict_ttl_secs must be <= {MAX_VERDICT_TTL_SECS} (1 day), got {}",
+                self.sites.verdict_ttl_secs
+            );
         }
         if self.sites.user_agent.trim().is_empty() {
             bail!("sites.user_agent must be a non-empty string");
@@ -1648,6 +1710,53 @@ samples = 5
             assert!(err.contains(field), "expected {field} in: {err}");
             assert!(err.contains(ceiling), "expected ceiling {ceiling} in: {err}");
         }
+    }
+
+    #[test]
+    fn count_and_duration_upper_bounds_are_enforced() {
+        let base = "[subscriptions]\nfiles = [\"~/sub.yaml\"]\n\n[classes.dev]\nlisten = \"127.0.0.1:20100\"\n";
+
+        // Defaults sit far below the ceilings and must still validate.
+        assert!(toml::from_str::<Config>(base).unwrap().validate().is_ok());
+
+        // Ceiling-edge values are accepted: each bound is a sanity cap that
+        // only catches gross typos, not a tighter operational limit.
+        let edge = format!(
+            "{base}\n[probe]\nconcurrency = 1024\n\n[health]\nfail_threshold = 100\ndrain_grace_secs = 3600\n\n[sites]\nmax_candidates = 64\nverdict_ttl_secs = 86400\n"
+        );
+        assert!(
+            toml::from_str::<Config>(&edge).unwrap().validate().is_ok(),
+            "ceiling-edge values must pass"
+        );
+
+        // One past each ceiling is rejected with a message naming the field
+        // and the limit, so a typo (36000 for 3600, ms for s) is actionable
+        // instead of silently retaining retired paths for hours, disabling
+        // recovery, or immortalising freeze verdicts.
+        for (section, over, field, ceiling) in [
+            ("probe", "concurrency = 1025", "probe.concurrency", "1024"),
+            ("health", "fail_threshold = 101", "health.fail_threshold", "100"),
+            ("health", "drain_grace_secs = 3601", "health.drain_grace_secs", "3600"),
+            ("sites", "max_candidates = 65", "sites.max_candidates", "64"),
+            ("sites", "verdict_ttl_secs = 86401", "sites.verdict_ttl_secs", "86400"),
+        ] {
+            let text = format!("{base}\n[{section}]\n{over}\n");
+            let err = toml::from_str::<Config>(&text)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(field), "expected {field} in: {err}");
+            assert!(err.contains(ceiling), "expected ceiling {ceiling} in: {err}");
+        }
+
+        // A seconds-vs-milliseconds typo in drain_grace_secs (36000 for 3600)
+        // is the exact failure mode the bound exists for.
+        let cfg: Config =
+            toml::from_str(&format!("{base}\n[health]\ndrain_grace_secs = 36000\n")).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("health.drain_grace_secs"), "{err}");
+        assert!(err.contains("3600"), "{err}");
     }
 
     #[test]

@@ -325,6 +325,17 @@ pub async fn is_healthy_sampled<F: Fn() -> bool>(
 mod tests {
     use super::*;
 
+    /// Test-only join guard for spawned fake servers. With loopback DOWN (a
+    /// bare `unshare -rn` skips `ip link set lo up`), `accept` blocks forever
+    /// and an unguarded join hangs the whole suite; the timeout turns that
+    /// environment dependency into a visible, actionable failure.
+    async fn join_server(task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("fake server task did not finish within 10s (is loopback up in this netns?)")
+            .unwrap();
+    }
+
     #[test]
     fn connect_targets_normalize_and_reject_garbage() {
         assert_eq!(
@@ -458,7 +469,7 @@ mod tests {
             .unwrap();
         assert_eq!(code, 204);
 
-        task.await.unwrap();
+        join_server(task).await;
         assert_eq!(
             CONNECT_PROBE_PAYLOAD, b"GET / HTTP/1.0\r\n\r\n",
             "the payload literal is pinned so the observed-vs-const asserts below cannot both drift"
@@ -498,7 +509,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(!is_healthy(addr, "connect://api.example:443", t).await);
-        task.await.unwrap();
+        join_server(task).await;
     }
 
     /// The remote-reset shape (2026-09-22 exit-IP blacklist signature): the
@@ -520,7 +531,7 @@ mod tests {
             "EOF must surface as tunnel-closed or a probe I/O error: {e}"
         );
         assert!(!is_healthy(addr, "connect://api.example:443", T2).await);
-        task.await.unwrap();
+        join_server(task).await;
     }
 
     /// Any response byte proves the round trip; its content is never
@@ -538,7 +549,7 @@ mod tests {
             .unwrap();
         assert_eq!(code, 200, "the verdict rides the CONNECT status");
         assert!(is_healthy(addr, "connect://api.example:443", T2).await);
-        task.await.unwrap();
+        join_server(task).await;
     }
 
     /// Any-fail rule: one dead sample inside a tick sinks the whole tick,
@@ -565,7 +576,7 @@ mod tests {
             .await,
             SampledVerdict::Unhealthy
         );
-        task.await.unwrap();
+        join_server(task).await;
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.iter().map(|(_, p)| p.as_deref()).collect::<Vec<_>>(),
@@ -583,7 +594,7 @@ mod tests {
             is_healthy_sampled(addr, "connect://api.example:443", T2, 3, || false).await,
             SampledVerdict::Healthy
         );
-        task.await.unwrap();
+        join_server(task).await;
 
         // samples = 0 clamps to a single sample.
         let (addr, _seen, task) = spawn_connect_fake(vec![(
@@ -595,7 +606,7 @@ mod tests {
             is_healthy_sampled(addr, "connect://api.example:443", T2, 0, || false).await,
             SampledVerdict::Healthy
         );
-        task.await.unwrap();
+        join_server(task).await;
     }
 
     /// Cancellation is a distinct verdict, not a health fact: a tick aborted
@@ -618,7 +629,7 @@ mod tests {
             })
             .await;
         assert_eq!(verdict, SampledVerdict::Cancelled);
-        task.await.unwrap();
+        join_server(task).await;
         assert_eq!(
             seen.lock().unwrap().len(),
             1,
@@ -631,7 +642,7 @@ mod tests {
             is_healthy_sampled(addr, "connect://api.example:443", T2, 3, || true).await,
             SampledVerdict::Cancelled
         );
-        task.await.unwrap();
+        join_server(task).await;
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -662,6 +673,6 @@ mod tests {
 
         let healthy = is_healthy(addr, "http://api.example/", Duration::from_secs(2)).await;
         assert!(!healthy, "3xx must not count as healthy");
-        task.await.unwrap();
+        join_server(task).await;
     }
 }

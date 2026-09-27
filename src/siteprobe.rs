@@ -296,6 +296,15 @@ impl TlsClient {
 mod tests {
     use super::*;
 
+    /// Test-only join guard for spawned fake servers: see the health.rs twin.
+    /// Unguarded joins hang forever when loopback is DOWN in the netns.
+    async fn join_server(task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("fake server task did not finish within 10s (is loopback up in this netns?)")
+            .unwrap();
+    }
+
     #[test]
     fn status_classification_separates_refusals_from_ambiguity() {
         assert_eq!(classify_status(200), SiteStatus::Ok);
@@ -312,8 +321,8 @@ mod tests {
 
     #[test]
     fn https_url_splitting_accepts_only_https_authorities() {
-        let (host, port, target, _) = split_https_url("https://www.cnbc.com/markets/").unwrap();
-        assert_eq!(host, "www.cnbc.com");
+        let (host, port, target, _) = split_https_url("https://www.example.com/markets/").unwrap();
+        assert_eq!(host, "www.example.com");
         assert_eq!(port, 443);
         assert_eq!(target, "/markets/");
 
@@ -381,6 +390,6 @@ mod tests {
         sock.write_all(b"GO\n").await.unwrap();
         let second = read_status_line_socket(&mut sock).await.unwrap();
         assert_eq!(second, 403);
-        server.await.unwrap();
+        join_server(server).await;
     }
 }

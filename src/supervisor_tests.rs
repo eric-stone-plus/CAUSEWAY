@@ -192,8 +192,9 @@ impl DataPlane for FakePlane {
         // is hardening, not a proven fix: a fresh 24k-sample probe at this
         // exact boundary found 0 budget exhaustions (max 25.8 ms), and the
         // 1/40 loaded-netns "all candidates failed to activate" flake was
-        // never attributable — supervisor.rs's aggregated bail discards the
-        // per-candidate cause. Only transient AddrInUse is retryable; any
+        // never attributable at the time — the aggregated bail discarded the
+        // per-candidate cause (it now carries it; see try_candidates' Err
+        // payload). Only transient AddrInUse is retryable; any
         // other bind error fails the start immediately (no retry-loop).
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         let listener = loop {
@@ -989,6 +990,189 @@ async fn health_recovery_cooldown_skips_churn_but_manual_path_is_unblocked() {
 }
 
 #[tokio::test]
+async fn manual_switch_bail_names_the_last_candidate_failure() {
+    // The aggregated bail must stay diagnosable: when the requested node and
+    // every fallback candidate fail, the error names the last failure instead
+    // of swallowing it into a bare "all candidates failed".
+    let (ctx, class, _trace, dir) = recovery_fixture(
+        vec![node("current"), node("target"), node("fallback")],
+        [("target", 503), ("fallback", 503)],
+        1,
+        0,
+        "manual-bail-cause",
+    );
+
+    let err = switch_to(&ctx, &class, "target")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("all candidates failed to activate"), "{err}");
+    assert!(
+        err.contains("last failure: fallback: "),
+        "the aggregated bail must carry the final candidate's cause: {err}"
+    );
+    assert_eq!(
+        class.lock().await.active.as_ref().unwrap().node.name(),
+        "current",
+        "a failed manual switch keeps the incumbent path"
+    );
+
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn manual_switch_bail_falls_back_to_the_requested_node_cause() {
+    // With no other node to fall back to (every pool member is either the
+    // request or the incumbent), the requested node's own failure is the only
+    // cause available — the bail must report it rather than degrade to the
+    // bare pre-cause message.
+    let (ctx, class, _trace, dir) = recovery_fixture(
+        vec![node("current"), node("target")],
+        [("target", 503)],
+        1,
+        0,
+        "manual-bail-requested-cause",
+    );
+
+    let err = switch_to(&ctx, &class, "target")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("all candidates failed to activate"), "{err}");
+    assert!(
+        err.contains("last failure: target: "),
+        "the bail must carry the requested node's cause when no fallback exists: {err}"
+    );
+    assert_eq!(
+        class.lock().await.active.as_ref().unwrap().node.name(),
+        "current",
+        "a failed manual switch keeps the incumbent path"
+    );
+
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn aggregated_cause_names_the_final_failing_candidate() {
+    // The contract is the LAST candidate's cause. A first-not-last capture
+    // would still report a genuine failure, so only a multi-candidate sweep
+    // discriminates: the manual-switch pins leave a fallback pool of exactly
+    // one node, where first == last.
+    let (ctx, class, trace, dir) = recovery_fixture(
+        vec![node("current"), node("first"), node("mid"), node("last")],
+        [("first", 503), ("mid", 503), ("last", 503)],
+        1,
+        0,
+        "last-cause-freshness",
+    );
+
+    {
+        let mut rt = class.lock().await;
+        let err = try_candidates(
+            &ctx,
+            &mut rt,
+            &[node("first"), node("mid"), node("last")],
+            "test",
+        )
+        .await
+        .unwrap_err();
+        let cause = err.expect("three candidates were attempted, so a cause exists");
+        assert!(
+            cause.starts_with("last: "),
+            "the aggregated cause must be the final candidate's, got: {cause}"
+        );
+    }
+    assert_eq!(trace.starts(), ["first", "mid", "last"]);
+
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn manual_switch_before_any_attempt_reports_no_candidate_not_failure() {
+    // The reply must not claim candidates failed when shutdown pre-empted the
+    // very first attempt. Empty response queue: any adapter start at all would
+    // trip FakePlane's "unexpected data-plane start" and fail this test.
+    let (ctx, class, trace, dir) = recovery_fixture(
+        vec![node("current"), node("target")],
+        std::iter::empty::<(&str, u16)>(),
+        1,
+        0,
+        "manual-shutdown-before-first",
+    );
+    // watch::send stores nothing while no receiver is alive and the fixture
+    // drops its receiver, so subscribe first or the flag silently never lands.
+    let shutdown = ctx.drain_shutdown.subscribe();
+    ctx.drain_shutdown.send(true).unwrap();
+    assert!(*shutdown.borrow(), "the shutdown flag must be visible");
+
+    let err = switch_to(&ctx, &class, "target")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no candidate was attempted"), "{err}");
+    assert!(
+        !err.contains("all candidates failed"),
+        "nothing was attempted, so the failure headline would be a lie: {err}"
+    );
+    assert!(
+        trace.starts().is_empty(),
+        "no adapter may be started once shutdown is requested: {:?}",
+        trace.starts()
+    );
+    assert_eq!(
+        class.lock().await.active.as_ref().unwrap().node.name(),
+        "current",
+        "the incumbent path is untouched"
+    );
+
+    drop(shutdown);
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn shutdown_abort_keeps_the_causes_already_attempted() {
+    // Aborting the remaining tail must not discard what already failed: the
+    // reply has to name the fallback candidate that actually ran, not degrade
+    // to the requested node's older cause. FakePlane signals shutdown the
+    // instant fb-a starts, so fb-b is skipped by the between-candidates check.
+    let (ctx, class, trace, dir) = recovery_fixture_with_delays(
+        vec![node("current"), node("target"), node("fb-a"), node("fb-b")],
+        [("target", 503), ("fb-a", 503), ("fb-b", 503)],
+        1,
+        0,
+        "manual-abort-keeps-cause",
+        HashMap::new(),
+        Some("fb-a"),
+    );
+
+    let err = switch_to(&ctx, &class, "target")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("last failure: fb-a: "),
+        "the freshest attempted cause must survive the abort: {err}"
+    );
+    assert!(
+        !err.contains("last failure: target: "),
+        "the requested node's older cause must not displace it: {err}"
+    );
+    assert_eq!(trace.starts(), ["target", "fb-a"]);
+    assert_eq!(
+        class.lock().await.active.as_ref().unwrap().node.name(),
+        "current",
+        "a failed manual switch keeps the incumbent path"
+    );
+
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn missing_active_path_also_obeys_health_recovery_cooldown() {
     let (ctx, class, trace, dir) = recovery_fixture(
         vec![node("current"), node("alternate")],
@@ -1034,9 +1218,12 @@ async fn only_successful_publication_schedules_and_stops_old_handle() {
 
     {
         let mut rt = class.lock().await;
-        assert_eq!(
-            try_candidates(&ctx, &mut rt, &[node("bad")], "test").await,
-            None
+        let err = try_candidates(&ctx, &mut rt, &[node("bad")], "test")
+            .await
+            .unwrap_err();
+        assert!(
+            err.unwrap().starts_with("bad: "),
+            "the aggregated cause names the failing candidate"
         );
         assert_eq!(
             rt.active.as_ref().unwrap().handle.describe(),
@@ -1051,7 +1238,7 @@ async fn only_successful_publication_schedules_and_stops_old_handle() {
         let mut rt = class.lock().await;
         assert_eq!(
             try_candidates(&ctx, &mut rt, &[node("good")], "test").await,
-            Some("good".to_string())
+            Ok("good".to_string())
         );
         assert_eq!(rt.active.as_ref().unwrap().node.name(), "good");
         assert_eq!(rt.route.read().unwrap().generation, 4);
@@ -1981,9 +2168,8 @@ async fn class_target_precheck_failures_never_touch_the_shared_scores() {
         .probe_count;
 
     let mut rt = class.lock().await;
-    let installed =
-        try_candidates(&ctx, &mut rt, &[node("alternate")], "test").await;
-    assert_eq!(installed, None, "the 503 pre-check fails the candidate");
+    let installed = try_candidates(&ctx, &mut rt, &[node("alternate")], "test").await;
+    assert!(installed.is_err(), "the 503 pre-check fails the candidate");
     drop(rt);
     let after = lock_state(&ctx.state)
         .nodes

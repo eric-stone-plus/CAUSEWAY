@@ -108,8 +108,8 @@ the same leg anti-bot systems fingerprint.
 
 ```bash
 causeway sites                      # freeze matrix: site × node verdicts
-causeway sites --probe www.cnbc.com # refresh one site across the pool
-causeway switch --class crawler --for-site www.cnbc.com --yes
+causeway sites --probe www.example.com # refresh one site across the pool
+causeway switch --class crawler --for-site www.example.com --yes
 ```
 
 `--for-site` is probe-first automation: the incumbent node is re-probed
