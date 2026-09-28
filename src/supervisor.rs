@@ -52,6 +52,14 @@ const AUTO_RECOVERY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from
 /// A remote refresh and several adapter pre-checks must finish before systemd's
 /// stop deadline. This is a transaction fuse, not a client timeout: expiry
 /// happens before the durable state commit, so staged paths can be discarded.
+///
+/// That deadline also has consumers the unit file's 150s+30s budget does not
+/// account for: candidate tails — path recovery, manual switches, site-driven
+/// switches, probe-driven switching — are unfused, because drain_shutdown is only
+/// latched after run has joined the switch-capable tasks (see try_candidates).
+/// Their length scales with health.timeout_ms, so raising that timeout can push
+/// the whole stop past TimeoutStopSec. No figure is quoted because none has ever
+/// been measured.
 const SUBSCRIPTION_PRECOMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 /// `/proc` polling is deliberately slow enough to avoid becoming a route
 /// monitor in disguise. A route-manager transient must remain unchanged for
@@ -370,7 +378,18 @@ async fn schedule_drain_with(
 /// Shutdown is allowed to skip the remaining grace period, but every retired
 /// handle must still be dropped and its child stopped before the daemon exits.
 async fn stop_draining(ctx: &Ctx) {
-    let _ = ctx.drain_shutdown.send(true);
+    // send_replace, not send: watch::Sender::send gates on receiver_count() and
+    // stores NOTHING when every receiver has been dropped, so a receiver-less send
+    // would leave the flag unset — the latch would simply be lost, and any
+    // subscriber that appeared later would read false in a process that has
+    // already begun stopping. Receiver-less is the normal clean shutdown, not an
+    // edge case: the channel's initial receiver is dropped at construction, and
+    // run joins every switch-capable task before calling this, so the only
+    // receivers that can still exist are the drain tasks' — and those are joined
+    // below, after this store, because the store is what releases them from their
+    // grace period. Latching must not be conditional on someone happening to
+    // listen.
+    ctx.drain_shutdown.send_replace(true);
     let mut draining = ctx.draining.lock().await;
     while let Some(result) = draining.join_next().await {
         if let Err(e) = result {
@@ -586,14 +605,29 @@ async fn try_candidates(
     candidates: &[Node],
     reason: &str,
 ) -> Result<String, Option<String>> {
-    // A recovery racing shutdown must not drag its full candidate tail past
-    // the drain deadline: up to MAX_SWITCH_CANDIDATES x (spawn + readiness +
-    // pre-check), which is tens of seconds at default timeouts and grows
-    // toward the ceiling if timeout_ms is raised. Check between candidates
-    // only — never cancel an in-flight try_activate: plane.start spawns the
-    // adapter before it returns the handle, so a mid-start cancel has no
-    // handle to stop and orphans the process. The worst case is one extra
-    // candidate finishing after shutdown is requested, not the whole tail.
+    // Design intent: a recovery racing shutdown must not drag its full candidate
+    // tail past the drain deadline — up to MAX_SWITCH_CANDIDATES x (spawn +
+    // readiness + pre-check). Check between candidates only, never cancel an
+    // in-flight try_activate: plane.start spawns the adapter before it returns the
+    // handle, so a mid-start cancel has no handle to stop and orphans the process.
+    //
+    // NOT WIRED IN PRODUCTION (derived from source, not runtime-verified):
+    // drain_shutdown's only non-test store is stop_draining, which run calls after
+    // joining every switch-capable task — see stop_draining for the ordering. In
+    // the release binary this arm and switch_node_locked's pre-rebuild filter
+    // therefore never fire; only tests reach them, by setting the flag while
+    // candidates remain — directly, or through a fixture clone fired inside
+    // FakePlane::start. The bound above consequently does not hold in the release
+    // binary, and the exposure is not limited to a recovery already in flight:
+    // run awaits those tasks untimed, and they re-check the signal unevenly —
+    // probe_loop only at the top of its select, the control-socket dispatcher not
+    // after a dispatch — so work begun after the stop signal can still launch a
+    // fresh candidate tail (health_loop, by contrast, re-checks before
+    // recovering). The only bound left is systemd's TimeoutStopSec, which a
+    // raised health.timeout_ms can exceed, after which KillMode=control-group
+    // SIGKILLs and skips the drain, workspace cleanup and state save. Latching
+    // the flag at signal time instead of after the joins is a behaviour change,
+    // not a comment; it is tracked as audit backlog 10.
     let shutdown = ctx.drain_shutdown.subscribe();
     let mut last_cause: Option<String> = None;
     for cand in candidates {
@@ -632,6 +666,156 @@ async fn try_candidates(
     Err(last_cause)
 }
 
+/// What happened to the last-resort rebuild of the incumbent node. Named
+/// states rather than a bool, because "a rebuild was attempted" and "a rebuild
+/// failed" are different claims and only the second may be reported as a
+/// failure.
+#[derive(Clone, Copy)]
+enum Rebuild {
+    /// Nothing to rebuild: no path is active, or the active node left the pool.
+    NotPossible,
+    /// Shutdown landed before the rebuild's first candidate start.
+    Aborted,
+    /// The rebuild ran and failed.
+    Failed,
+}
+
+/// The tail shared by the recovery trail and the manual-switch reply.
+///
+/// Claiming a path is being kept when none was ever published is the same
+/// overclaim the wording rules below exist to prevent, and on the bail path it
+/// is worse than a bad log line: that text is returned to the operator over the
+/// control socket by `causeway switch`.
+///
+/// The same-node egress rebuild keeps its own literal instead of calling this
+/// (its `warn!` is unreachable without an active node: the same function returns
+/// early on `rt.active == None`, and holds the class lock from that capture
+/// across the activation await, so the node cannot be unpublished underneath
+/// it), so it needs no derived tail.
+fn path_tail(path_active: bool) -> &'static str {
+    if path_active {
+        "keeping current path"
+    } else {
+        "no active path to keep"
+    }
+}
+
+/// What the recovery trail may say about the alternate (non-incumbent)
+/// candidates. Kept separate from `Rebuild` because the two attempts are
+/// independent: an empty pool can still rebuild the incumbent, and a field of
+/// failing alternates can still find no incumbent to rebuild.
+#[derive(Clone, Copy)]
+enum Alternates {
+    /// No alternate was started: the pool offered none, or shutdown landed
+    /// before the first start (that second cause is test-only today — see
+    /// try_candidates). Nothing may be claimed about alternates.
+    NotAttempted,
+    /// At least one alternate was started and failed. Not "every one": a
+    /// shutdown landing mid-loop returns only the LAST cause it collected, so the
+    /// tail may never have run. That state cannot reach the composed trail — the
+    /// caller returns on the same monotonic flag before composing — so the matrix
+    /// below may keep its universal wording only because of that caller filter.
+    /// Add any second cause-carrying early exit to try_candidates and three of
+    /// its cells become lies; see the note on recovery_headline's matrix.
+    Failed,
+}
+
+/// Compose the recovery-trail headline so it never claims more than happened.
+///
+/// Three honesty rules, each of which was once violated by a single hardcoded
+/// string:
+/// - no rebuild failure may be reported unless a rebuild ran and failed; an
+///   aborted rebuild and no incumbent at all are separate states with their own
+///   wording.
+/// - no alternate-candidate failure may be reported when no alternate was
+///   attempted (an empty pool, or a shutdown landing before the first start —
+///   the latter test-only today, see try_candidates).
+///   The original string keyed this off "is there any cause at all", which
+///   conflated the rebuild's own cause with the alternates': an empty pool whose
+///   incumbent rebuild then failed reported "all candidates ... failed" for
+///   candidates that never ran. The state is now an explicit input.
+/// - no path may be claimed as kept when there is none. `rt.active` is written
+///   together with the route table by both of its publishers (`install_active`
+///   and the subscription transaction) under the class lock, and is cleared only
+///   in `run`'s teardown, which joins every listener first, so while a class is
+///   being served its absence means no path was published.
+///
+/// Kept as free functions so these rules are pinned by direct unit tests;
+/// capturing the log instead would make the assertions depend on process-global
+/// tracing state (callsite interest caching, the single global dispatcher slot)
+/// that sibling tests can perturb.
+fn recovery_headline(alternates: Alternates, rebuild: Rebuild, path_active: bool) -> String {
+    // Total 2x3 matrix. A pure function cannot prove more than its arguments
+    // carry, and Failed means "at least one", so the three universal wordings
+    // below ("all candidates ...") rest on two things outside this signature:
+    //   1. the caller filter — try_candidates' only cause-carrying early exit is
+    //      its shutdown arm, and switch_node_locked returns on that same monotonic
+    //      flag BEFORE composing here, so Failed arrives only from an exhausted
+    //      loop; and
+    //   2. "candidates" denoting the attempted slice (.take(MAX_SWITCH_CANDIDATES)
+    //      of an uncapped ranked_candidates), not the whole pool.
+    // Break either and the cells overclaim with the suite still green: the
+    // emission anchors are the only seam that can see the composed string.
+    // The two Rebuild::Aborted cells below are pinned by tests but are never
+    // emitted in the release binary (see try_candidates). They stay because the
+    // matrix must be total and the tests own the wording.
+    let outcome = match (alternates, rebuild) {
+        (Alternates::Failed, Rebuild::Failed) => "all candidates and current-node rebuild failed",
+        (Alternates::Failed, Rebuild::Aborted) => {
+            "all candidates failed and the current-node rebuild was aborted by shutdown"
+        }
+        (Alternates::Failed, Rebuild::NotPossible) => {
+            "all candidates failed and no current-node rebuild was attempted"
+        }
+        (Alternates::NotAttempted, Rebuild::Failed) => "the current-node rebuild failed",
+        (Alternates::NotAttempted, Rebuild::Aborted) => {
+            "the current-node rebuild was aborted by shutdown"
+        }
+        (Alternates::NotAttempted, Rebuild::NotPossible) => "no candidate was attempted",
+    };
+    format!("{outcome}, {}", path_tail(path_active))
+}
+
+/// Derives `path_active` from the runtime so that derivation is unit-testable
+/// instead of living only at the call site.
+fn recovery_headline_for(
+    rt: &ClassRuntime,
+    alternates: Alternates,
+    rebuild: Rebuild,
+) -> String {
+    recovery_headline(alternates, rebuild, rt.active.is_some())
+}
+
+/// Event-to-state half of the headline honesty rules: `try_candidates` returns
+/// `Err(None)` only from its shutdown-abort arm (the rebuild slice is never
+/// empty), so a `None` cause separates a rebuild that was aborted by shutdown
+/// from one that ran and failed — a distinction the release binary never draws
+/// today, that arm being test-only (see try_candidates). Kept as a free
+/// function, mirroring
+/// `recovery_headline_for`, because at the call site the choice is only
+/// observable in the emitted trail and an inverted mapping survived the suite.
+fn rebuild_outcome(cause: Option<&str>) -> Rebuild {
+    match cause {
+        Some(_) => Rebuild::Failed,
+        None => Rebuild::Aborted,
+    }
+}
+
+/// The same derivation for the alternate-candidate side, where `Err(None)` has
+/// two meanings that both forbid the claim: an empty slice (the pool offered no
+/// alternate), and a shutdown that landed before the first start (test-only
+/// today, see try_candidates). Only a cause proves an alternate ran. In the
+/// binary this is the single place `NotAttempted` is constructed, so the state
+/// can never arrive here by default: the call site below derives it from this
+/// function for every pool, empty ones included. Tests construct the state
+/// directly to pin the matrix, which is why the claim is scoped to the binary.
+fn alternates_outcome(cause: Option<&str>) -> Alternates {
+    match cause {
+        Some(_) => Alternates::Failed,
+        None => Alternates::NotAttempted,
+    }
+}
+
 /// The automatic recovery flow: try other scored nodes first, then rebuild
 /// the current logical node as a last resort. A physical egress change cannot
 /// migrate an existing adapter TCP session; rebuilding gives the kernel a new
@@ -656,24 +840,47 @@ async fn switch_node_locked(ctx: &Arc<Ctx>, rt: &mut ClassRuntime, reason: &str)
         (candidates, current_node)
     };
 
-    let mut last_cause: Option<String> = None;
-    if !candidates.is_empty() {
-        match try_candidates(ctx, rt, &candidates, reason).await {
-            Ok(_) => return true,
-            Err(cause) => last_cause = cause,
-        }
-    }
+    // try_candidates returns Err(None) both for an empty slice and for a
+    // shutdown that landed before the first start, so a cause is the only proof
+    // that an alternate actually ran; without one the trail may not speak of
+    // candidate failures (honesty rule 2 in recovery_headline).
+    //
+    // The empty pool is deliberately NOT short-circuited around the call. An
+    // empty slice is a no-op inside try_candidates (the loop body never runs, so
+    // no log line, event or state write) and returns Err(None), which derives
+    // NotAttempted through the same single path as every other outcome. Both
+    // states are bound out of that one match, so no mutable default can carry an
+    // underived value into the trail, and a future flip of this argument has no
+    // default to flip. (The overclaim this selector exists to prevent had a
+    // different shape: the headline was keyed off `last_cause.is_some()`, and the
+    // rebuild's own cause could set it — a conflated input, not an initialization
+    // hazard.) Reintroducing an initializer is not free either: it is then dead on
+    // every path, which the unused-variable/mutability lints report in BOTH build
+    // flavours — measured, unlike dead_code, which needs the item unreferenced by
+    // test code and so fires only in a non-test build.
+    let (alternates, mut last_cause) = match try_candidates(ctx, rt, &candidates, reason).await {
+        Ok(_) => return true,
+        Err(cause) => (alternates_outcome(cause.as_deref()), cause),
+    };
 
     // Skip the last-resort rebuild (and its misleading "rebuilding" log) once
     // shutdown is requested; try_candidates would abort at its first candidate
-    // anyway, but this keeps the trail honest.
+    // anyway, but this keeps the trail honest. Test-only today: the flag is never
+    // set in the release binary before run has joined this task (see
+    // try_candidates), so the trail-honesty benefit is currently null there.
     if *ctx.drain_shutdown.subscribe().borrow() {
         info!(class = %rt.name, reason, "path recovery aborted before current-node rebuild: shutdown requested");
         return false;
     }
 
+    // Stays NotPossible when there is no incumbent, so the trail below cannot
+    // claim a rebuild was attempted and failed. Unlike `alternates` above, this
+    // initializer is load-bearing rather than redundant: NotPossible cannot be
+    // derived from the Err payload, so dropping the guard and calling
+    // rebuild_outcome(None) would map the no-incumbent case to Aborted.
+    let mut rebuild = Rebuild::NotPossible;
     if let Some(current_node) = current_node {
-        info!(class = %rt.name, node = %current_node.name(), reason, "rebuilding current node after alternate candidates failed");
+        info!(class = %rt.name, node = %current_node.name(), reason, "rebuilding current node as the last resort");
         match try_candidates(
             ctx,
             rt,
@@ -683,26 +890,25 @@ async fn switch_node_locked(ctx: &Arc<Ctx>, rt: &mut ClassRuntime, reason: &str)
         .await
         {
             Ok(_) => return true,
-            // The rebuild's own failure is the freshest cause; keep the
-            // alternate-candidate cause only if no candidate was attempted.
-            Err(cause) => last_cause = cause.or(last_cause),
+            // The rebuild's own cause is the freshest when it has one; keep the
+            // alternate cause only for the rebuild's shutdown-abort arm, which
+            // by definition produced none (an arm the release binary never takes
+            // — see try_candidates).
+            Err(cause) => {
+                rebuild = rebuild_outcome(cause.as_deref());
+                last_cause = cause.or(last_cause);
+            }
         }
     }
-    // The headline must not claim candidates failed when none was ever
-    // attempted (an empty pool with no incumbent, or a shutdown landing just
-    // past the check above).
+    // The headline comes from a pure selector so the honesty rules are
+    // unit-testable without capturing logs; see recovery_headline. It takes the
+    // two attempt states rather than the cause: the cause now only feeds the
+    // error= field, so a rebuild's cause can no longer be misread as evidence
+    // that alternates ran.
+    let headline = recovery_headline_for(rt, alternates, rebuild);
     match &last_cause {
-        Some(cause) => error!(
-            class = %rt.name,
-            reason,
-            error = %cause,
-            "all candidates and current-node rebuild failed, keeping current path"
-        ),
-        None => error!(
-            class = %rt.name,
-            reason,
-            "no candidate was attempted, keeping current path"
-        ),
+        Some(cause) => error!(class = %rt.name, reason, error = %cause, "{headline}"),
+        None => error!(class = %rt.name, reason, "{headline}"),
     }
     false
 }
@@ -817,14 +1023,32 @@ async fn switch_to(
             installed,
             fallback: true,
         }),
-        // Same honesty rule as the recovery trail: only claim candidates
-        // failed when one actually was attempted.
-        Err(last_cause) => match last_cause.or(requested_cause) {
-            Some(cause) => anyhow::bail!(
-                "all candidates failed to activate, keeping current path (last failure: {cause})"
-            ),
-            None => anyhow::bail!("no candidate was attempted, keeping current path"),
-        },
+        // Same honesty rules as the recovery trail: only claim candidates
+        // failed when one actually was attempted, and only claim a path is
+        // being kept when one was published. This text reaches the operator
+        // through the control socket, so an overclaim here is user-visible.
+        //
+        // The head says "no candidate could be activated", not "all candidates
+        // failed": the Err payload cannot prove the field was exhausted. A
+        // shutdown landing between candidates returns the causes collected so
+        // far, so the tail may never have started (pinned by
+        // shutdown_abort_keeps_the_causes_already_attempted, where the last
+        // fallback is skipped) — a universal claim there tells the operator
+        // every candidate was tried when one was not. What both arms prove is
+        // that nothing was installed; the head states the stronger claim that no
+        // candidate in the field this daemon tried could be activated, which the
+        // exhaustion arm proves and the shutdown arm (pinned by the test above)
+        // does not — it is kept because it is the honest reading of "the field we
+        // ran", and the abort case is test-only today (see try_candidates).
+        Err(last_cause) => {
+            let tail = path_tail(rt.active.is_some());
+            match last_cause.or(requested_cause) {
+                Some(cause) => anyhow::bail!(
+                    "no candidate could be activated, {tail} (last failure: {cause})"
+                ),
+                None => anyhow::bail!("no candidate was attempted, {tail}"),
+            }
+        }
     }
 }
 

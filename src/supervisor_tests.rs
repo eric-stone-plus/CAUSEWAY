@@ -168,9 +168,19 @@ impl DataPlane for FakePlane {
         // Deterministic mid-recovery shutdown seam: signal drain_shutdown the
         // instant the named node starts, so the between-candidates check sees
         // it on the very next iteration (no responder-delay timing race).
+        //
+        // Deliberately plain `send` + expect rather than the product side's
+        // send_replace (see stop_draining): here the Err is the signal worth
+        // having, because it means a trigger fired from a path holding no
+        // drain_shutdown subscriber (activate_initial, subscription switch,
+        // site-probe, test_node, egress rebuild) and the shutdown would be
+        // lost. Not a guaranteed diagnosis — site-probe and test_node run the
+        // plane inside a JoinSet whose error arm only warns, so a panic there
+        // is swallowed; the paths that propagate it are what this protects.
         if let Some((trigger, tx)) = &self.shutdown_trigger {
             if *trigger == node_name {
-                let _ = tx.send(true);
+                tx.send(true)
+                    .expect("shutdown seam fired with no live drain_shutdown subscriber");
             }
         }
         let delay_ms = self.delays.get(&node_name).copied().unwrap_or(0);
@@ -191,7 +201,8 @@ impl DataPlane for FakePlane {
         // the 250 ms wall-clock deadline is ~5.8x that, pure headroom. This
         // is hardening, not a proven fix: a fresh 24k-sample probe at this
         // exact boundary found 0 budget exhaustions (max 25.8 ms), and the
-        // 1/40 loaded-netns "all candidates failed to activate" flake was
+        // 1/40 loaded-netns "all candidates failed to activate" flake (that
+        // wording has since changed; see switch_to's bail) was
         // never attributable at the time — the aggregated bail discarded the
         // per-candidate cause (it now carries it; see try_candidates' Err
         // payload). Only transient AddrInUse is retryable; any
@@ -685,10 +696,14 @@ async fn failed_rebuild_keeps_old_route_handle_and_generation() {
 #[tokio::test]
 async fn recovery_in_progress_aborts_remaining_tail_on_shutdown() {
     // Three alternates that all fail pre-check, then the incumbent rebuild.
-    // FakePlane signals drain_shutdown the instant the first alternate starts,
-    // so a recovery already in progress must abort its remaining tail instead
-    // of dragging <=MAX_SWITCH_CANDIDATES x (spawn + readiness + pre-check)
-    // (~90s worst case) past the drain deadline. The check sits BETWEEN
+    // FakePlane signals drain_shutdown the instant the first alternate starts —
+    // a scenario the release binary cannot produce, because run stores the flag
+    // only after joining every switch-capable task (see try_candidates). Only
+    // tests can drive the intended bound, by setting the flag while candidates
+    // remain; this is one of them: with the flag set mid-recovery the remaining
+    // tail must abort instead of
+    // dragging <=MAX_SWITCH_CANDIDATES x (spawn + readiness + pre-check) past
+    // the drain deadline. The check sits BETWEEN
     // candidates: the in-flight try_activate runs to completion and stops its
     // own handle, so no adapter is orphaned by the abort.
     let (ctx, class, trace, dir) = recovery_fixture_with_delays(
@@ -993,7 +1008,7 @@ async fn health_recovery_cooldown_skips_churn_but_manual_path_is_unblocked() {
 async fn manual_switch_bail_names_the_last_candidate_failure() {
     // The aggregated bail must stay diagnosable: when the requested node and
     // every fallback candidate fail, the error names the last failure instead
-    // of swallowing it into a bare "all candidates failed".
+    // of swallowing it into a bare "no candidate could be activated".
     let (ctx, class, _trace, dir) = recovery_fixture(
         vec![node("current"), node("target"), node("fallback")],
         [("target", 503), ("fallback", 503)],
@@ -1006,10 +1021,23 @@ async fn manual_switch_bail_names_the_last_candidate_failure() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("all candidates failed to activate"), "{err}");
+    assert!(err.contains("no candidate could be activated"), "{err}");
     assert!(
         err.contains("last failure: fallback: "),
         "the aggregated bail must carry the final candidate's cause: {err}"
+    );
+    // The other half of the tail's truth table: this fixture keeps "current"
+    // published, so the operator-facing reply must say the path is kept. Without
+    // this the tail is only pinned from the no-active-path side, and hardcoding
+    // path_tail(false) at the bail survives green while telling the operator
+    // there is no path to keep.
+    assert!(
+        err.contains("keeping current path"),
+        "the incumbent is still published, so the reply must say it is kept: {err}"
+    );
+    assert!(
+        !err.contains("no active path to keep"),
+        "a path is published: {err}"
     );
     assert_eq!(
         class.lock().await.active.as_ref().unwrap().node.name(),
@@ -1039,7 +1067,7 @@ async fn manual_switch_bail_falls_back_to_the_requested_node_cause() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("all candidates failed to activate"), "{err}");
+    assert!(err.contains("no candidate could be activated"), "{err}");
     assert!(
         err.contains("last failure: target: "),
         "the bail must carry the requested node's cause when no fallback exists: {err}"
@@ -1102,11 +1130,11 @@ async fn manual_switch_before_any_attempt_reports_no_candidate_not_failure() {
         0,
         "manual-shutdown-before-first",
     );
-    // watch::send stores nothing while no receiver is alive and the fixture
-    // drops its receiver, so subscribe first or the flag silently never lands.
-    let shutdown = ctx.drain_shutdown.subscribe();
-    ctx.drain_shutdown.send(true).unwrap();
-    assert!(*shutdown.borrow(), "the shutdown flag must be visible");
+    // send_replace, not send: the fixture drops the channel's initial receiver,
+    // so a plain send would store nothing here (mechanism in stop_draining).
+    // Using it keeps this pin free of any subscriber-ordering dependency.
+    ctx.drain_shutdown.send_replace(true);
+    assert!(*ctx.drain_shutdown.borrow(), "the shutdown flag must be visible");
 
     let err = switch_to(&ctx, &class, "target")
         .await
@@ -1128,7 +1156,6 @@ async fn manual_switch_before_any_attempt_reports_no_candidate_not_failure() {
         "the incumbent path is untouched"
     );
 
-    drop(shutdown);
     stop_draining(&ctx).await;
     std::fs::remove_dir_all(dir).ok();
 }
@@ -1161,6 +1188,14 @@ async fn shutdown_abort_keeps_the_causes_already_attempted() {
         !err.contains("last failure: target: "),
         "the requested node's older cause must not displace it: {err}"
     );
+    // The head of this reply may not claim the field was exhausted: the abort
+    // below skips fb-b, so "all candidates failed" would report an attempt that
+    // never happened to the operator over the control socket. What is provable
+    // from the Err payload is only that nothing was installed.
+    assert!(
+        !err.contains("all candidates"),
+        "fb-b never started (see the trace assertion below), so no universal claim is provable: {err}"
+    );
     assert_eq!(trace.starts(), ["target", "fb-a"]);
     assert_eq!(
         class.lock().await.active.as_ref().unwrap().node.name(),
@@ -1169,6 +1204,90 @@ async fn shutdown_abort_keeps_the_causes_already_attempted() {
     );
 
     stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn failed_activation_records_a_probe_failure_into_shared_scores() {
+    // The positive counterpart of
+    // class_target_precheck_failures_never_touch_the_shared_scores: with no
+    // class-specific override, a candidate that fails its pre-check says
+    // something true about the node's generic fitness, so it must write a
+    // probe failure into the shared EMA — otherwise a node that cannot even
+    // start keeps its stale score and stays ranked for the next switch.
+    let (ctx, class, _trace, dir) = recovery_fixture(
+        vec![node("current"), node("alternate")],
+        [("alternate", 503)],
+        1,
+        0,
+        "trycand-shared-score-write",
+    );
+    let before = {
+        let st = lock_state(&ctx.state);
+        let s = st.nodes.get("alternate").unwrap();
+        (s.probe_count, s.success_ema)
+    };
+
+    {
+        let mut rt = class.lock().await;
+        let installed = try_candidates(&ctx, &mut rt, &[node("alternate")], "test").await;
+        assert!(installed.is_err(), "the 503 pre-check fails the candidate");
+    }
+
+    let st = lock_state(&ctx.state);
+    let after = st.nodes.get("alternate").unwrap();
+    assert_eq!(
+        after.probe_count,
+        before.0 + 1,
+        "a failed activation must be recorded as one probe"
+    );
+    assert!(
+        after.success_ema < before.1,
+        "and it must pull the shared success EMA down: {} -> {}",
+        before.1,
+        after.success_ema
+    );
+    drop(st);
+
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn stop_draining_latches_the_shutdown_flag_without_subscribers() {
+    // The receiver side of the trap argued at the production sender
+    // (stop_draining). The fixture drops the channel's initial receiver and
+    // starts no plane, so the receiver count asserted below is the state the
+    // flag must survive — pinned explicitly, because the anchor would also
+    // pass with a live receiver and would then prove nothing.
+    let (ctx, _class, _trace, dir) = recovery_fixture(
+        vec![node("current")],
+        std::iter::empty::<(&str, u16)>(),
+        1,
+        0,
+        "drain-flag-latches",
+    );
+    assert_eq!(
+        ctx.drain_shutdown.receiver_count(),
+        0,
+        "the precondition is a receiver-less channel"
+    );
+    assert!(
+        !*ctx.drain_shutdown.borrow(),
+        "the fixture starts with the flag clear"
+    );
+
+    stop_draining(&ctx).await;
+
+    assert!(
+        *ctx.drain_shutdown.borrow(),
+        "stop_draining must latch the flag even with zero live receivers"
+    );
+    assert!(
+        *ctx.drain_shutdown.subscribe().borrow(),
+        "and a later subscriber must see it"
+    );
+
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -2529,6 +2648,240 @@ async fn per_class_pinned_override_holds_while_global_policy_stays_automatic() {
     let outcome = switch_to(&ctx, &class, "alternate").await.unwrap();
     assert_eq!(outcome.installed, "alternate");
     assert_eq!(trace.starts(), vec!["alternate"]);
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn recovery_headline_never_claims_a_rebuild_that_did_not_run() {
+    // The original defect: one hardcoded string reported a failed current-node
+    // rebuild even when there was no incumbent to rebuild. An aborted rebuild
+    // is a third state — it started no candidate, so it may not be reported as
+    // a failure either.
+    let failed = recovery_headline(Alternates::Failed, Rebuild::Failed, true);
+    assert!(
+        failed.contains("current-node rebuild failed"),
+        "a rebuild that ran and failed must say so: {failed}"
+    );
+
+    for alternates in [Alternates::Failed, Alternates::NotAttempted] {
+        for not_failed in [Rebuild::NotPossible, Rebuild::Aborted] {
+            let headline = recovery_headline(alternates, not_failed, true);
+            assert!(
+                !headline.contains("rebuild failed"),
+                "no rebuild ran to failure, so claiming one is the defect: {headline}"
+            );
+        }
+        assert!(
+            recovery_headline(alternates, Rebuild::Aborted, true)
+                .contains("rebuild was aborted by shutdown"),
+            "the aborted state must name shutdown rather than imply a failure"
+        );
+    }
+    // The "nothing was attempted" wording belongs to the state where alternates
+    // ran: with no alternate attempted either, the honest report is the broader
+    // "no candidate was attempted" (pinned in
+    // recovery_headline_never_claims_alternates_failed_when_none_ran).
+    assert!(
+        recovery_headline(Alternates::Failed, Rebuild::NotPossible, true)
+            .contains("no current-node rebuild was attempted"),
+        "the no-incumbent state must say nothing was attempted"
+    );
+}
+
+#[test]
+fn rebuild_outcome_separates_a_failed_rebuild_from_an_aborted_one() {
+    // Err(None) is try_candidates' shutdown-abort arm; any cause means the
+    // rebuild ran and failed. Inverting this mapping would report an aborted
+    // rebuild as a failure or hide a real failure as an abort, and at the call
+    // site the choice is only observable in the emitted trail, which the suite
+    // does not capture — so the mapping is pinned here instead.
+    assert!(
+        matches!(rebuild_outcome(Some("dial refused")), Rebuild::Failed),
+        "a rebuild that produced a cause ran and failed"
+    );
+    assert!(
+        matches!(rebuild_outcome(None), Rebuild::Aborted),
+        "no cause is the shutdown abort, not a failure"
+    );
+}
+
+#[test]
+fn alternates_outcome_only_counts_a_candidate_that_actually_ran() {
+    // try_candidates returns Err(None) both for an empty slice and for a
+    // shutdown landing before the first start. Reporting alternates as failed
+    // in either case is the overclaim this mapping exists to prevent, and like
+    // its rebuild twin it is only observable in the emitted trail at the call
+    // site — so the mapping is pinned here.
+    assert!(
+        matches!(
+            alternates_outcome(Some("dial refused")),
+            Alternates::Failed
+        ),
+        "a cause proves at least one alternate was started"
+    );
+    assert!(
+        matches!(alternates_outcome(None), Alternates::NotAttempted),
+        "no cause means no alternate ran, so none may be reported as failed"
+    );
+}
+
+#[test]
+fn recovery_headline_never_claims_alternates_failed_when_none_ran() {
+    // The overclaim this pins: with an empty pool (or a shutdown before the
+    // first start) the incumbent rebuild still runs, and its own cause used to
+    // stand in for "candidates failed" — so a recovery that tried exactly one
+    // node reported "all candidates and current-node rebuild failed". Each
+    // rebuild state gets its own wording instead, and none of them may mention
+    // alternates.
+    for rebuild in [Rebuild::NotPossible, Rebuild::Aborted, Rebuild::Failed] {
+        let headline = recovery_headline(Alternates::NotAttempted, rebuild, true);
+        assert!(
+            !headline.contains("all candidates"),
+            "no alternate ran, so a field of candidates is invented: {headline}"
+        );
+        assert!(
+            !headline.contains("candidates failed"),
+            "{headline}"
+        );
+    }
+    assert!(
+        recovery_headline(Alternates::NotAttempted, Rebuild::NotPossible, true)
+            .contains("no candidate was attempted"),
+        "nothing at all ran: neither alternates nor a rebuild"
+    );
+    assert!(
+        recovery_headline(Alternates::NotAttempted, Rebuild::Failed, true)
+            .contains("the current-node rebuild failed"),
+        "only the rebuild ran, so only it may be reported"
+    );
+    assert!(
+        recovery_headline(Alternates::NotAttempted, Rebuild::Aborted, true)
+            .contains("the current-node rebuild was aborted by shutdown"),
+        "the aborted rebuild names shutdown, not a failure"
+    );
+}
+
+#[test]
+fn recovery_headline_reports_alternates_only_when_they_ran() {
+    // The dual of the pin above: when alternates did run and fail, the wording
+    // must name them, qualified by the rebuild state.
+    assert!(
+        recovery_headline(Alternates::Failed, Rebuild::Failed, true)
+            .contains("all candidates and current-node rebuild failed")
+    );
+    assert!(
+        recovery_headline(Alternates::Failed, Rebuild::Aborted, true)
+            .contains("all candidates failed and the current-node rebuild was aborted by shutdown")
+    );
+    assert!(
+        recovery_headline(Alternates::Failed, Rebuild::NotPossible, true)
+            .contains("all candidates failed and no current-node rebuild was attempted")
+    );
+}
+
+#[test]
+fn recovery_headline_never_claims_to_keep_a_path_that_does_not_exist() {
+    // rt.active is written together with the route table by both of its
+    // publishers and is cleared only in run's teardown, so while a class is
+    // being served its absence means no path was published. Every arm used to
+    // end in "keeping current path", which is false in every active-is-none
+    // state: the ledger's production-reachable case (no incumbent and no probed
+    // alternate), and equally the no-incumbent case with failing alternates
+    // that missing_active_path_also_obeys_health_recovery_cooldown builds.
+    for rebuild in [Rebuild::NotPossible, Rebuild::Aborted, Rebuild::Failed] {
+        for alternates in [Alternates::Failed, Alternates::NotAttempted] {
+            let active = recovery_headline(alternates, rebuild, true);
+            assert!(active.contains("keeping current path"), "{active}");
+
+            let inactive = recovery_headline(alternates, rebuild, false);
+            assert!(
+                !inactive.contains("keeping current path"),
+                "no path exists to keep: {inactive}"
+            );
+            assert!(inactive.contains("no active path to keep"), "{inactive}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_headline_for_derives_path_active_from_the_runtime() {
+    // The call site used to pass `rt.active.is_some()` inline, where no test
+    // could reach it: hardcoding either bool survived the whole suite.
+    // Deriving it inside the wrapper makes that argument pinnable without
+    // capturing logs.
+    let (ctx, class, _trace, dir) = recovery_fixture(
+        vec![node("current")],
+        std::iter::empty::<(&str, u16)>(),
+        1,
+        0,
+        "headline-derives-path-active",
+    );
+    {
+        let rt = class.lock().await;
+        assert!(rt.active.is_some(), "the fixture publishes an active path");
+        let headline = recovery_headline_for(&rt, Alternates::Failed, Rebuild::Failed);
+        assert!(headline.contains("keeping current path"), "{headline}");
+    }
+    {
+        let mut rt = class.lock().await;
+        rt.active.take();
+        let headline = recovery_headline_for(&rt, Alternates::Failed, Rebuild::Failed);
+        assert!(
+            !headline.contains("keeping current path"),
+            "nothing is published, so nothing is being kept: {headline}"
+        );
+        assert!(
+            headline.contains("no active path to keep"),
+            "{headline}"
+        );
+    }
+
+    stop_draining(&ctx).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn manual_switch_with_no_active_path_does_not_claim_to_keep_one() {
+    // switch_to never requires an incumbent, and activate_initial's all-failed
+    // path leaves a class with no active node. A manual switch there used to
+    // reply "keeping current path" while nothing was published — and unlike
+    // the recovery trail, that text is returned to the operator over the
+    // control socket by `causeway switch`.
+    let (ctx, class, trace, dir) = recovery_fixture(
+        vec![node("current"), node("target")],
+        [("target", 503), ("current", 503)],
+        1,
+        0,
+        "manual-switch-no-active-path",
+    );
+    {
+        let mut rt = class.lock().await;
+        rt.active.take();
+        *rt.route.write().unwrap() = ClassRoute::default();
+    }
+
+    let err = switch_to(&ctx, &class, "target")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no active path to keep"),
+        "the reply must not claim a path it is not keeping: {err}"
+    );
+    assert!(
+        !err.contains("keeping current path"),
+        "nothing was published for this class: {err}"
+    );
+    assert!(
+        err.contains("no candidate could be activated"),
+        "the candidate failures are real and must still be reported: {err}"
+    );
+    assert!(
+        !trace.starts().is_empty(),
+        "candidates really were attempted, so reporting their failure is honest"
+    );
+
     stop_draining(&ctx).await;
     std::fs::remove_dir_all(dir).ok();
 }
