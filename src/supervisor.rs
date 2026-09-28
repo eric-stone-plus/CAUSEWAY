@@ -627,7 +627,7 @@ async fn try_candidates(
     // raised health.timeout_ms can exceed, after which KillMode=control-group
     // SIGKILLs and skips the drain, workspace cleanup and state save. Latching
     // the flag at signal time instead of after the joins is a behaviour change,
-    // not a comment; the decision record lives in docs/pitfalls.md (P3).
+    // not a comment; the decision record lives in PITFALLS.md (P3).
     let shutdown = ctx.drain_shutdown.subscribe();
     let mut last_cause: Option<String> = None;
     for cand in candidates {

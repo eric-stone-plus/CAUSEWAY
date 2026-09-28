@@ -32,7 +32,7 @@ SendSIGKILL=yes
 # tails (path recovery, manual / site / probe-driven switching) also run
 # inside this window, scaling with health.timeout_ms — five candidates x
 # (10s readiness + the timeout) crosses 180s once the timeout passes ~26s
-# (docs/pitfalls.md P3/P4). If health.timeout_ms is raised, re-derive this bound;
+# (PITFALLS.md P3/P4). If health.timeout_ms is raised, re-derive this bound;
 # past it, KillMode=control-group skips drain, cleanup and state save. Leave
 # 30s for listener drain, adapter cleanup, and state flush.
 TimeoutStopSec=180s

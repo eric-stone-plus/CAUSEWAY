@@ -36,7 +36,7 @@ direct_hosts = []
 default = "local-primary"
 
 # A local profile may merge several YAML manifest snapshots. Unsupported entry
-# types are rejected explicitly at parse time.
+# types are skipped at parse time (counted, not an error).
 [subscriptions.profiles.local-primary]
 files = [
   "~/.local/share/causeway/subscriptions/example.yaml",

@@ -1,19 +1,17 @@
 # CAUSEWAY
 
-> **Archived.** This is the original implementation, kept for reference; it
-> is not under active development.
-
-CAUSEWAY is a supervised local egress gateway for a 24/7 quantitative-research
+CAUSEWAY is a supervised local egress gateway for a long-running Linux
 workstation. It exposes a small set of stable loopback endpoints — one per
-traffic class — and keeps each of them attached to a healthy upstream,
-switching upstreams with zero client-visible downtime. Selection policy is
-explicit config: a region allowlist (`selection.regions`, automatic paths
-only) and a pinned mode (`selection.auto_switch = false`) where a working
-active node never moves without operator action.
+traffic class — and keeps each attached to a healthy upstream, switching
+upstreams with zero client-visible downtime. Selection policy is explicit
+config: a region allowlist on node names (`selection.regions`, automatic
+paths only) and a pinned mode (`selection.auto_switch = false`) where the
+active node never moves without operator action — even a failing one.
 
-One Rust binary, one TOML config file, one systemd user unit. No GUI, no
-HTTP/metrics servers — the only runtime control surface is a local Unix
-socket used by the bundled `switch` subcommand.
+One Rust binary, one TOML config file, one systemd user unit. No GUI beyond
+the bundled dashboard TUI, no HTTP/metrics servers — the only runtime
+control surface is a local Unix socket used by the bundled CLI subcommands
+(`switch`, `sites`, …) and the dashboard.
 
 ## Principles
 
@@ -37,7 +35,7 @@ socket used by the bundled `switch` subcommand.
   target parsing, or general-purpose rule evaluation. Each inbound connection
   is classified by its first byte and piped byte-for-byte from then on.
   An optional, exact-host allowlist (`routing.direct_hosts`) is compiled into
-  the supervised adapters, so approved API destinations can connect directly
+  the supervised adapters, so approved destinations can connect directly
   while all unmatched destinations retain the active node. Changes to this
   list take effect after the daemon is restarted.
 
@@ -56,12 +54,17 @@ socket used by the bundled `switch` subcommand.
   one profile supplies the live pool at a time. Sources may be local snapshots
   or a private credential file plus an atomic last-known-good cache. Remote
   candidates are fetched, parsed, and checked on staged paths before the live
-  pool changes; malformed entries are skipped individually, and unsupported
-  entry types are rejected explicitly rather than silently degraded.
+  pool changes; entries with missing or mistyped fields are skipped
+  individually with a warning, and unsupported entry types are counted and
+  skipped by design.
 - **Scoring.** Periodic bounded-concurrency probes feed a success-rate EMA
   (primary) and an RTT EMA (tiebreaker) per endpoint; the active path
   additionally gets a continuous full-path health check with a configurable
   failure threshold.
+- **Egress observation.** The kernel's preferred default route is observed
+  read-only; after a sustained, debounced change the same logical node is
+  rebuilt on a fresh adapter, atomically shifted, and the old path drained —
+  without touching link state, route metrics, or DNS.
 - **Observability.** Structured logs to stdout for journald plus a
   daily-rotated JSON Lines file; a `status` subcommand reads the state file
   and works whether or not the daemon is running.
@@ -95,19 +98,18 @@ listener and its active node), a quality-ranked node table for the focused
 class with per-node traffic columns, events feed, `s` subscription picker,
 `t` end-to-end test of all nodes, `/` node-table filter, `c` paste-ready
 proxy exports, `?` key help, and Tab to cycle classes so Enter switches
-only that class (plain table when piped) — see `--help` for details. After
-startup the dashboard never blocks on the daemon: requests run on background
-tasks with one per lane, superseded replies are discarded, and data age is
-shown honestly (STALE past the refresh cadence; quitting during an
-in-flight change asks for a second keypress). Logs:
-`journalctl --user -u causeway -f`.
+only that class (plain table when piped). After startup the dashboard never
+blocks on the daemon: requests run on background tasks with one per lane,
+superseded replies are discarded, and data age is shown honestly (STALE
+flags as replies age past their cadence; quitting during an in-flight change
+asks for a second keypress). Logs: `journalctl --user -u causeway -f`.
 
 ### Site freeze awareness (anti-bot)
 
-Scraping stacks routinely share one egress until a site freezes that exit
-IP. `[sites.list]` names the sites worth protecting; each entry is probed
-per node with a real HTTPS GET (browser User-Agent, status line only) —
-the same leg anti-bot systems fingerprint.
+Scraping or API stacks routinely share one egress until a site freezes that
+exit IP. `[sites.list]` names the sites worth protecting; each entry is
+probed per node with a real HTTPS GET (browser User-Agent, status line only)
+— the same leg anti-bot systems fingerprint.
 
 ```bash
 causeway sites                      # freeze matrix: site × node verdicts
@@ -121,7 +123,10 @@ moves when the site still serves it — a failure inside the scraping stack
 never rotates the exit. On a confirmed freeze (401/403/429/451) the next
 `sites.max_candidates` score-ordered nodes are probed and the class moves
 to the first one the site serves. 5xx and timeouts stay `unknown` and never
-steer a switch. Verdicts persist in the state file as an advisory matrix.
+select a destination: a node is only switched to on a confirmed serve. An
+`unknown` incumbent does not by itself block rotation — the search proceeds
+and the first node the site confirmed serves wins. Verdicts persist in the
+state file as an advisory matrix.
 
 A deployment whose default profile is remote-only needs one bootstrap step:
 the daemon never fetches at startup, and a first fetch requires the running
@@ -141,9 +146,9 @@ src/
   peek.rs          first-byte protocol classifier
   listener.rs      mixed listener, atomic route table, L4 piping
   dataplane.rs     DataPlane trait + supervised external-adapter implementation
-  egress.rs        default-route observation and same-node rebuilds
-  events.rs        event ring feeding the TUI events feed
-  siteprobe.rs     per-site freeze probes over each node
+  egress.rs        read-only default-route observation + same-node rebuilds
+  events.rs        in-memory event ring served to the TUI
+  siteprobe.rs     per-site freeze probes through each node
   daemon_lock.rs   process-wide ownership of the daemon's mutable runtime state
   probe.rs         bounded-concurrency TCP probing
   health.rs        minimal full-path health check
@@ -151,7 +156,7 @@ src/
   state.rs         atomic state-file persistence (tmp + rename)
   supervisor.rs    orchestration: activation, health loop, probe loop, switching
   supervisor_tests.rs  shared fixtures + supervisor/switch integration tests
-docs/              operational pitfalls and field notes (pitfalls.md)
+PITFALLS.md        operational field notes + audit-recorded engineering traps
 scripts/           data-plane dependency installers
 systemd/           user unit (Restart=always + sandbox hardening)
 config.example.toml  configuration reference; every field documented

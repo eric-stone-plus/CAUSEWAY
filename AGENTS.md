@@ -2,7 +2,7 @@
 
 ## What this is
 
-A supervised local egress gateway for a 24/7 quant research workstation
+A supervised local egress gateway for a long-running Linux workstation
 (Arch, x86_64). Single Rust crate, single binary: `src/main.rs` entry,
 modules flat in `src/`.
 
@@ -35,8 +35,8 @@ cargo clippy           # before committing (not a hard gate)
    `config.rs` validation — do not relax it.
 2. No GUI, no HTTP/metrics servers. Runtime control is exactly one local
    Unix socket in the state dir (`src/control.rs`, mode 0600, newline JSON),
-   used only by the bundled `causeway switch` subcommand — nothing network
-   reachable. Exactly one TOML config file.
+   used only by the bundled CLI (`switch`, `sites`, the dashboard) — nothing
+   network reachable. Exactly one TOML config file.
 3. Stability over latency: switch conservatively, never flap eagerly.
    Hysteresis lives in `src/score.rs`; any change must update its unit tests
    in the same commit.
@@ -58,8 +58,8 @@ cargo clippy           # before committing (not a hard gate)
 - `src/main.rs` — clap subcommands (run/probe/status/config check/switch) +
   tracing init.
 - `src/control.rs` — the one runtime control surface: a 0600 Unix socket in
-  the state dir, newline-delimited JSON (ping/status/switch), plus the
-  one-shot client used by `causeway switch`.
+  the state dir, newline-delimited JSON (ping/status/switch/sites), plus the
+  one-shot client used by the CLI subcommands and polled by the dashboard.
 - `src/switch.rs` — nmtui-style interactive node switcher (ratatui +
   crossterm) with an always-visible class strip; plain status report when
   stdout is not a terminal. Async refresh spine: every daemon request
@@ -99,7 +99,8 @@ cargo clippy           # before committing (not a hard gate)
 - `src/supervisor.rs` — orchestration: activation, health loop, probe loop,
   check-then-switch, draining.
 - `scripts/` — data-plane dependency installers.
-- `docs/` — operational pitfalls and field notes (abstract; no deployment specifics).
+- `PITFALLS.md` — operational field notes and audit-recorded pitfalls
+  (abstract; no deployment specifics).
 - `systemd/causeway.service` — user unit (Restart=always + sandboxing).
 - `config.example.toml` — configuration reference; any field change must be
   mirrored here.

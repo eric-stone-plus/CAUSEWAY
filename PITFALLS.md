@@ -1,7 +1,9 @@
-# Operational pitfalls
+# PITFALLS
 
-Field notes on failure classes this design is meant to avoid. Entries stay
-abstract: mechanism and lesson only, never deployment specifics.
+Field notes on failure classes this design is meant to avoid, plus the
+engineering traps recorded by the audit rounds (entries P1-P9, H1-H10).
+Entries stay abstract: mechanism and lesson only, never deployment
+specifics.
 
 ## Synthetic-DNS system proxies vs. resolver-validating applications
 
