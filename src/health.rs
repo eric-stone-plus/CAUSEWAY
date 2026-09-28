@@ -418,9 +418,10 @@ mod tests {
                 // mode: "the checker wrote no probe" must be a recorded
                 // fact, not a fake-side assumption — otherwise the non-2xx
                 // pin below is true by construction and unfalsifiable.
-                // The window is deliberately generous (widened from 500 ms,
-                // audit backlog 12/R9): only the negative pins ever wait it
-                // out, and a scheduling stall must not fake "no probe".
+                // The window is deliberately generous (widened from an
+                // earlier 500 ms after adversarial review): only the negative
+                // pins ever wait it out, and a scheduling stall must not fake
+                // "no probe".
                 if let Ok(Ok(m)) =
                     tokio::time::timeout(Duration::from_secs(1), sock.read(&mut buf)).await
                 {

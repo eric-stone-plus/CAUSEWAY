@@ -2490,8 +2490,8 @@ async fn probe_now_results_follow_pool_order_not_completion_order() {
 /// a probe task that panics leaves its slot empty — the listing comes back
 /// SHORT with the hole collapsed and survivors in pool order — while the
 /// pool total still counts every node, so the on-demand `Probed` event
-/// reads "2 of 3 ok" instead of a false "2 of 2 ok" (audit backlog 15/16;
-/// the behavior was sandbox-demonstrated 2026-09-26 but never pinned).
+/// reads "2 of 3 ok" instead of a false "2 of 2 ok" (found during the
+/// 2026-09 audit; sandbox-demonstrated before being pinned here).
 /// Mutation-verified: truncating the event total to `results.len()`,
 /// returning the short length as the pool total, or no-oping the panic
 /// injection each goes red on a distinct assert below.
@@ -2511,7 +2511,7 @@ async fn panicked_probe_task_shortens_listing_but_not_the_pool_total() {
         "probe-panic-slot",
     );
     // Key is test-unique: the hook is process-global, and a shared key
-    // would let the periodic twin's guard cancel this injection (B16-1).
+    // would let the periodic twin's guard cancel this injection.
     let _injection = probe_panic_hook::Injection::new("victim-now");
     let classes = Arc::new(HashMap::from([("dev".to_string(), class)]));
     let reply = handle_control(

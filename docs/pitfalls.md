@@ -253,3 +253,141 @@ shared, kernel-managed namespace must absorb the owner's own teardown window
 with a bounded retry, AND shrink the namespace until every remaining actor
 that could re-take the identity is enumerated and negligible — or not probe
 the namespace at all.
+
+## Code pitfalls from the audit rounds
+
+Tagged entries for stable referencing; P3 and P4 are cited from code and
+unit-file comments. Each entry states the mechanism, where it lives, and how
+it is known (VERIFIED-BY-TEST / VERIFIED-BY-MUTATION / DERIVED / INTENTIONAL
+/ BY CONSTRUCTION / historical record).
+
+### P1 — a `watch` latch must be stored with `send_replace`
+
+`watch::Sender::send` gates on `receiver_count()` and drops the value when
+no receiver exists. A one-way latch channel's initial receiver is dropped at
+construction, so a plain `send` loses the latch exactly on the common
+clean-shutdown path, where no subscriber is left — and the store itself is
+what releases the drain tasks from their grace period. `stop_draining`
+therefore stores with `send_replace`, unconditionally: latching must not be
+conditional on someone happening to listen. (src/supervisor.rs,
+`stop_draining`; VERIFIED-BY-MUTATION.)
+
+### P2 — state headlines must not outrun what ran
+
+A recovery that attempted nothing must not claim "all candidates failed"; a
+rebuild that never ran must not be reported failed; an abort must name
+shutdown rather than imply failure. `recovery_headline` composes an explicit
+`Alternates` x `Rebuild` matrix, with "candidates" meaning the attempted
+slice, and thin wrappers keep call sites honest. The general trap: deriving
+only half a state machine (states → wording as a pure function, events →
+states left inline) invites the wording half to drift from reality.
+(src/supervisor.rs; VERIFIED-BY-MUTATION.)
+
+### P3 — the drain latch is stored after the joins, so mid-recovery abort arms are test-only
+
+`drain_shutdown`'s only production store is `stop_draining`, which `run`
+calls after joining every switch-capable task; the `try_candidates` abort
+arm and the pre-rebuild filter therefore never fire in the release binary —
+only tests reach them, by setting the flag while candidates remain,
+directly or via a fixture clone inside `FakePlane::start`. Shutdown
+re-checks are uneven across the awaited tasks (`probe_loop` re-checks only
+at the top of its select, the control-socket dispatcher not after a
+dispatch; `health_loop`, by contrast, re-checks before recovering), and
+unfused candidate tails scale with `health.timeout_ms`; the only outer
+bound is the unit's `TimeoutStopSec`, past which `KillMode=control-group`
+SIGKILLs and skips drain, cleanup and state save. Latching the flag at
+signal time instead of after the joins is an INTENTIONAL recorded decision,
+not pending work: it changes shutdown semantics (grace-period release,
+abort visibility). DERIVED; falsifier: a single-candidate stop measured,
+under default configuration, taking longer than the drain deadline.
+
+### P4 — the unit stop budget must account for every consumer of its fuse
+
+`SUBSCRIPTION_PRECOMMIT_TIMEOUT` (150 s) fuses subscription preparation,
+but the unfused candidate tails of P3 also live inside the stop window and
+scale with `health.timeout_ms`: five candidates x (10 s readiness + the
+timeout) crosses 180 s once the timeout passes ~26 s. If `health.timeout_ms`
+is raised, re-derive `TimeoutStopSec` before relying on a graceful drain.
+(systemd/causeway.service, src/supervisor.rs; DERIVED.)
+
+### P5 — unguarded joins on spawned fake servers hang when loopback is down
+
+With loopback DOWN (`unshare -rn`), `accept` blocks forever, and an
+unguarded join on a spawned fake server turns a visible failure into a
+suite-wide hang reported only as a timeout. Every spawned fake-server join
+is timeout-guarded (a shared `join_server` helper in the health, siteprobe
+and control fixtures; inline 1-2 s timeout joins elsewhere), which converts
+the hang into an actionable failure; the netns requirement (`ip link set lo up`) is
+documented in AGENTS.md. (test fixtures; VERIFIED-BY-TEST via the netns
+counterfactual.)
+
+### P6 — log-only legs get no pins
+
+No test reads the daemon's log trail — capturing tracing output needs
+process-level log infrastructure the repo deliberately does not build, so
+no pin can exist for log-only surfaces. Log-only error paths are
+inspection-reviewed by construction; claims of test coverage must not be
+made for them. (BY CONSTRUCTION.)
+
+### P7 — the loaded-netns "all candidates failed to activate" flake
+
+Observed once at roughly 1/40 under heavy load (recorded at the fixture in
+src/supervisor_tests.rs), never reproduced, never attributed — the
+aggregated bail of the time discarded the per-candidate cause (it has since
+learned to carry it, and the wording changed). If it recurs, capture before
+debugging: the full failing-run output, the loadavg 5/15-minute fields at
+failure, and which candidate failed at which stage. Reproduce, file, then
+fix — no speculative retries. (Historical record; unreproduced.)
+
+### P8 — fixture sends that fire and forget hide lost signals
+
+The FakePlane shutdown seam deliberately uses plain `send` + `expect`
+rather than the product side's `send_replace`: in a fixture the send's
+`Err` is the signal worth having — it means a trigger fired from a path
+holding no drain subscriber and the shutdown would be lost. Fire-and-forget
+fixture sends turn that same loss into silence. (src/supervisor_tests.rs,
+FakePlane; documented at the seam, exercised by the suite.)
+
+### P9 — hand-synced retry mirrors drift
+
+The fixture's bind retry mirrors `dataplane`'s `bind_retrying_addr_in_use`
+by hand (the sync `#[test]` there panics on exhaustion, this async fn
+returns Err); any budget or policy change on one side must be re-derived
+for the other. Only transient `AddrInUse` is retryable; every other bind
+error fails the start immediately. (src/supervisor_tests.rs,
+src/dataplane.rs; documented at both sites.)
+
+## Harness pitfalls (test and evidence tooling)
+
+Each of these cost a real false green or a lost verdict before it was
+written down.
+
+- **H1** — `rc=$?` read after an `if` returns the `if`'s status, not the
+  command's. Capture once, immediately, into a variable.
+- **H2** — a stage script that truncates its log after any step that can
+  fail early leaves the previous run's PASS readable on a dead stage.
+  Truncate first; gate on per-stage content.
+- **H3** — a stamp gate must cover every artifact it polices and must fail
+  on empty extraction: compare recorded instrument checksums against the
+  live files at consumption time. Beware short-option clusters — an
+  argument-taking flag consumes the rest of the cluster, so `grep -m1E` is
+  `grep -m '1E'` and hard-errors; write flags separately.
+- **H4** — lines printed outside the tee wrapper never reach the artifact;
+  a PASS verdict over an artifact with an empty measurement section is
+  void.
+- **H5** — tally denominators must cover every accumulator: if failures
+  are counted per-anchor and per-suite, the release gate reads both or
+  neither.
+- **H6** — signal- or ENOSPC-killed test binaries print no FAILED line:
+  record child exit codes (137/139 and ENOSPC are discriminators) and fall
+  back to a raw tail when the failure filter matches nothing.
+- **H7** — load baselines sampled after your own build self-contend;
+  sample before the first build, from the 5/15-minute loadavg fields.
+- **H8** — backticks in echoed launcher text execute. Quote display
+  strings; dry-run launchers.
+- **H9** — `/tmp` holds snapshots, not assets: anything "prepared" there
+  is gone after a cleanup or reboot. Keep the spec, regenerate on demand.
+- **H10** — an unattributed red stays unattributed: one stress round
+  failed 18/30 with its outputs never captured (pre-H4/H6 tooling), and
+  the tree has since passed the same gate repeatedly. Recorded as
+  unattributed, not as passed.

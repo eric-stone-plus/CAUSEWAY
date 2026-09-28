@@ -1,5 +1,8 @@
 # CAUSEWAY
 
+> **Archived.** This is the original implementation, kept for reference; it
+> is not under active development.
+
 CAUSEWAY is a supervised local egress gateway for a 24/7 quantitative-research
 workstation. It exposes a small set of stable loopback endpoints — one per
 traffic class — and keeps each of them attached to a healthy upstream,
@@ -86,7 +89,7 @@ systemctl --user enable --now causeway
 loginctl enable-linger "$USER"     # optional: run while logged out
 ```
 
-CLI: `causeway run | probe | status | config check | switch`; bare
+CLI: `causeway run | probe | status | config check | switch | sites`; bare
 `causeway` opens the dashboard TUI — an always-visible class strip (every
 listener and its active node), a quality-ranked node table for the focused
 class with per-node traffic columns, events feed, `s` subscription picker,
@@ -132,15 +135,23 @@ profile and switch.
 src/
   main.rs          CLI subcommands + logging init
   config.rs        TOML loading and hard validation (loopback-only listeners, …)
+  control.rs       runtime control surface: local Unix socket (0600) + client
+  switch.rs        interactive dashboard TUI (plain status report when piped)
   subscription.rs  endpoint-manifest parsing + transactional private cache
   peek.rs          first-byte protocol classifier
   listener.rs      mixed listener, atomic route table, L4 piping
   dataplane.rs     DataPlane trait + supervised external-adapter implementation
+  egress.rs        default-route observation and same-node rebuilds
+  events.rs        event ring feeding the TUI events feed
+  siteprobe.rs     per-site freeze probes over each node
+  daemon_lock.rs   process-wide ownership of the daemon's mutable runtime state
   probe.rs         bounded-concurrency TCP probing
   health.rs        minimal full-path health check
   score.rs         EMA statistics + hysteresis decision
   state.rs         atomic state-file persistence (tmp + rename)
   supervisor.rs    orchestration: activation, health loop, probe loop, switching
+  supervisor_tests.rs  shared fixtures + supervisor/switch integration tests
+docs/              operational pitfalls and field notes (pitfalls.md)
 scripts/           data-plane dependency installers
 systemd/           user unit (Restart=always + sandbox hardening)
 config.example.toml  configuration reference; every field documented
@@ -153,4 +164,3 @@ MIT. See `LICENSE`.
 ## CI
 
 `ci.yml` runs `cargo test --locked` on every push and PR.
-`release.yml` remains manual-only (workflow_dispatch).
